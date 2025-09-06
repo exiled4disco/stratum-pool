@@ -22,6 +22,7 @@ class RealStratumServer extends EventEmitter {
         // Add these two lines here:
         this.cachedNetworkDifficulty = null;
         this.lastDifficultyUpdate = 0;
+        this.shareQueue = []
        
         // Initialize Bitcoin connector
         this.bitcoin = new BitcoinConnector({
@@ -35,6 +36,7 @@ class RealStratumServer extends EventEmitter {
         this.setupServer();
         this.setupBitcoinEvents();
         this.db = new DatabaseConnector();
+        this.startBatchProcessor();
 
     }
 
@@ -361,16 +363,16 @@ class RealStratumServer extends EventEmitter {
             const processingTime = Date.now() - startTime;
 
             // Log to database
-            await this.db.logShare(
-                miner.id, 
-                jobId, 
-                nonce, 
-                meetsPoolDifficulty, 
-                meetsPoolDifficulty, 
-                meetsNetworkDifficulty, 
-                blockHashHex, 
-                processingTime
-            );
+            //await this.db.logShare(
+            //    miner.id, 
+            //    jobId, 
+            //    nonce, 
+            //    meetsPoolDifficulty, 
+            //    meetsPoolDifficulty, 
+            //    meetsNetworkDifficulty, 
+            //    blockHashHex, 
+            //    processingTime
+            //);
 
             if (meetsNetworkDifficulty) {
                 console.log('BLOCK FOUND! Hash:', blockHashHex);
@@ -708,6 +710,31 @@ class RealStratumServer extends EventEmitter {
             return level[0];
         }
 
+        startBatchProcessor() {
+            setInterval(async () => {
+                if (this.shareQueue.length > 0) {
+                    const batch = this.shareQueue.splice(0, 100);
+                    try {
+                        for (const share of batch) {
+                            await this.db.logShare(
+                                share.minerId,
+                                share.jobId,
+                                share.nonce,
+                                share.isValid,
+                                share.meetsPoolDiff,
+                                share.meetsNetworkDiff,
+                                share.blockHash,
+                                share.processingTime
+                            );
+                        }
+                        console.log(`📊 DB: Logged ${batch.length} shares in batch`);
+                    } catch (error) {
+                        console.error('Batch logging error:', error);
+                    }
+                }
+            }, 5000);
+        }
+
         checkDifficulty(hash, target) {
             try {
                 const targetBuffer = this.difficultyToTarget(target);
@@ -852,22 +879,20 @@ server.start().then(success => {
 // }, 30000);
 
 // Display stats every 60 seconds
-setInterval(() => {
-    const stats = server.getStats();
-    console.log(`📊 Stats: ${stats.totalMiners} miners, ${stats.validShares}/${stats.totalShares} shares (${stats.efficiency}% efficiency)`);
-}, 60000);
-
 setInterval(async () => {
-    const stats = this.getStats();
-    await this.db.logPoolStats(
-        stats.totalMiners,
-        stats.totalShares,
-        stats.validShares,
-        parseFloat(stats.efficiency),
-        this.currentJob?.height || 0,
-        this.cachedNetworkDifficulty || 0
-    );
-}, 30000); // Log every 30 seconds
+   const stats = server.getStats();
+   console.log(`📊 Stats: ${stats.totalMiners} miners, ${stats.validShares}/${stats.totalShares} shares (${stats.efficiency}% efficiency)`);
+   
+   // Log to database every 60 seconds as well
+   await server.db.logPoolStats(
+       stats.totalMiners,
+       stats.totalShares,
+       stats.validShares,
+       parseFloat(stats.efficiency),
+       server.currentJob?.height || 0,
+       server.cachedNetworkDifficulty || 0
+   );
+}, 60000);
 
 // Graceful shutdown
 process.on('SIGINT', () => {
