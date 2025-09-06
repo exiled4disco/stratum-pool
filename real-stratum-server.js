@@ -544,7 +544,7 @@ class RealStratumServer extends EventEmitter {
             const coinbaseHash = this.doublesha256(coinbase);
             
             // Build merkle root
-            const merkleRoot = this.calculateMerkleRoot([coinbaseHash.toString('hex'), ...job.merkleSteps]);
+            const merkleRoot = this.calculateCorrectMerkleRoot([coinbaseHash.toString('hex'), ...job.merkleSteps]);
             
             // Construct 80-byte block header
             const header = Buffer.alloc(80);
@@ -641,30 +641,6 @@ class RealStratumServer extends EventEmitter {
             return hash2;
         }
 
-        calculateMerkleRoot(hashes) {
-            if (hashes.length === 0) return '0'.repeat(64);
-            if (hashes.length === 1) return hashes[0];
-            
-            let level = hashes.slice();
-            
-            while (level.length > 1) {
-                const nextLevel = [];
-                
-                for (let i = 0; i < level.length; i += 2) {
-                    const left = Buffer.from(level[i], 'hex').reverse();
-                    const right = level[i + 1] ? Buffer.from(level[i + 1], 'hex').reverse() : left;
-                    
-                    const combined = Buffer.concat([left, right]);
-                    const hash = this.doublesha256(combined);
-                    nextLevel.push(hash.reverse().toString('hex'));
-                }
-                
-                level = nextLevel;
-            }
-            
-            return level[0];
-        }
-
         calculateCorrectMerkleRoot(hashes) {
             if (hashes.length === 0) return '0'.repeat(64);
             if (hashes.length === 1) return hashes[0];
@@ -726,16 +702,6 @@ class RealStratumServer extends EventEmitter {
             // Convert to 32-byte buffer
             const targetHex = target.toString(16).padStart(64, '0');
             return Buffer.from(targetHex, 'hex');
-        }
-
-        getNetworkTarget() {
-            try {
-
-                return 73197670707408.73;
-            } catch (error) {
-                console.error('Error getting network difficulty:', error);
-                return 1;
-            }
         }
 
     sendDifficulty(miner) {
