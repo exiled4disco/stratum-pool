@@ -28,10 +28,15 @@ class DatabaseDashboard {
                     SELECT 
                         id, username, ip_address, connected_at,
                         total_shares, valid_shares,
-                        CASE WHEN disconnected_at IS NULL THEN true ELSE false END as is_connected
+                        CASE 
+                            WHEN disconnected_at IS NULL THEN true 
+                            WHEN disconnected_at >= NOW() - INTERVAL '2 minutes' THEN true
+                            ELSE false 
+                        END as is_connected
                     FROM miners 
-                    WHERE disconnected_at IS NULL OR disconnected_at >= NOW() - INTERVAL '5 minutes'
+                    WHERE connected_at >= CURRENT_DATE
                     ORDER BY connected_at DESC
+                    LIMIT 20
                 `);
 
                 // Get today's share statistics

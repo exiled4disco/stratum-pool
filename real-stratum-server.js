@@ -22,7 +22,7 @@ class RealStratumServer extends EventEmitter {
         // Add these two lines here:
         this.cachedNetworkDifficulty = null;
         this.lastDifficultyUpdate = 0;
-        this.shareQueue = []
+        this.shareQueue = [];
        
         // Initialize Bitcoin connector
         this.bitcoin = new BitcoinConnector({
@@ -889,8 +889,8 @@ server.start().then(success => {
 
 // Display stats every 60 seconds
 setInterval(async () => {
-   const stats = server.getStats();
-   console.log(`📊 Stats: ${stats.totalMiners} miners, ${stats.validShares}/${stats.totalShares} shares (${stats.efficiency}% efficiency)`);
+    const stats = server.getStats();
+    console.log(`📊 Stats: ${stats.totalMiners} miners, ${stats.validShares}/${stats.totalShares} shares (${stats.efficiency}% efficiency) - Queue: ${server.shareQueue.length}`);
    
    // Log to database every 60 seconds as well
    await server.db.logPoolStats(
