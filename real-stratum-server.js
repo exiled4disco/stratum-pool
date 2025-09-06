@@ -2,6 +2,7 @@ const net = require('net');
 const crypto = require('crypto');
 const EventEmitter = require('events');
 const BitcoinConnector = require('./bitcoin-connector');
+const DatabaseConnector = require('./database');
 
 class RealStratumServer extends EventEmitter {
     constructor(config = {}) {
@@ -33,6 +34,8 @@ class RealStratumServer extends EventEmitter {
        
         this.setupServer();
         this.setupBitcoinEvents();
+        this.db = new DatabaseConnector();
+
     }
 
     async start() {
@@ -143,6 +146,9 @@ class RealStratumServer extends EventEmitter {
             const duration = Date.now() - startTime;
             const avgTimePerShare = miner.shares > 0 ? duration / miner.shares : 0;
             console.log(`Connection lasted ${duration}ms, ${miner.shares} shares, ${avgTimePerShare.toFixed(0)}ms/share average`);
+            
+            // Log disconnection to database
+            this.db.logMinerDisconnection(miner.id);
             
             // Cleanup
             clearInterval(keepAlive);
@@ -264,6 +270,9 @@ class RealStratumServer extends EventEmitter {
         miner.authorized = true;
         miner.username = username;
         
+        // Log to database
+        this.db.logMinerConnection(miner.id, username, miner.address);
+        
         const response = {
             id: id,
             result: true,
@@ -309,6 +318,8 @@ class RealStratumServer extends EventEmitter {
     }
 
     async validateShare(miner, jobId, extranonce2, time, nonce) {
+        const startTime = Date.now();
+        
         if (!this.currentJob) {
             console.error('No current job available for share validation');
             return false;
@@ -326,12 +337,12 @@ class RealStratumServer extends EventEmitter {
         }
 
         try {
-            // Use cached header template and only update nonce/time
             const blockHeader = this.buildOptimizedBlockHeader(miner, extranonce2, time, nonce);
             const hash = this.calculateBlockHash(blockHeader);
             const reversedHash = Buffer.from(hash).reverse();
+            const blockHashHex = reversedHash.toString('hex');
 
-            console.log(`Hash: ${reversedHash.toString('hex').substring(0, 20)}...`);
+            console.log(`Hash: ${blockHashHex.substring(0, 20)}...`);
             
             // Check pool difficulty
             const poolTarget = Buffer.from('ff00000000000000000000000000000000000000000000000000000000000000', 'hex');
@@ -339,15 +350,31 @@ class RealStratumServer extends EventEmitter {
             
             console.log(`Meets pool difficulty: ${meetsPoolDifficulty}`);
 
-            // Check network difficulty with real-time difficulty
+            // Check network difficulty
             const networkDifficulty = await this.getNetworkTarget();
             const networkTarget = this.difficultyToTarget(networkDifficulty);
             const meetsNetworkDifficulty = reversedHash.compare(networkTarget) <= 0;
 
             console.log(`Meets network difficulty: ${meetsNetworkDifficulty}`);
 
+            // Calculate processing time
+            const processingTime = Date.now() - startTime;
+
+            // Log to database
+            await this.db.logShare(
+                miner.id, 
+                jobId, 
+                nonce, 
+                meetsPoolDifficulty, 
+                meetsPoolDifficulty, 
+                meetsNetworkDifficulty, 
+                blockHashHex, 
+                processingTime
+            );
+
             if (meetsNetworkDifficulty) {
-                console.log('🎉 BLOCK FOUND! Hash:', reversedHash.toString('hex'));
+                console.log('BLOCK FOUND! Hash:', blockHashHex);
+                await this.db.logBlockFound(miner.id, blockHashHex, this.currentJob.height);
                 await this.submitFoundBlock(blockHeader, miner, extranonce2);
             }
 
@@ -829,6 +856,18 @@ setInterval(() => {
     const stats = server.getStats();
     console.log(`📊 Stats: ${stats.totalMiners} miners, ${stats.validShares}/${stats.totalShares} shares (${stats.efficiency}% efficiency)`);
 }, 60000);
+
+setInterval(async () => {
+    const stats = this.getStats();
+    await this.db.logPoolStats(
+        stats.totalMiners,
+        stats.totalShares,
+        stats.validShares,
+        parseFloat(stats.efficiency),
+        this.currentJob?.height || 0,
+        this.cachedNetworkDifficulty || 0
+    );
+}, 30000); // Log every 30 seconds
 
 // Graceful shutdown
 process.on('SIGINT', () => {
