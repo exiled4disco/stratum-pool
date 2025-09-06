@@ -9,7 +9,7 @@ class BitcoinConnector extends EventEmitter {
             host: config.host || '127.0.0.1',
             port: config.port || 8332,
             user: config.user || 'btc_40',
-            pass: config.pass || '12345nN',
+            pass: config.pass || '1234nN',
             timeout: 30000,
             ...config
         };
@@ -37,9 +37,30 @@ class BitcoinConnector extends EventEmitter {
 
     async callRpc(method, params = []) {
         return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                reject(new Error('RPC timeout'));
+            }, 10000);
+
             bitcoin.call(method, params, (err, data) => {
+                clearTimeout(timeout);
+                
                 if (err) {
-                    reject(new Error(`RPC Error: ${err.message || err}`));
+                    // Handle string errors that start with 'W' (warnings)
+                    if (typeof err === 'string') {
+                        if (err.startsWith('W')) {
+                            console.warn(`Bitcoin Core warning for ${method}: ${err}`);
+                            resolve(null); // Treat as non-fatal
+                        } else {
+                            reject(new Error(`RPC Error: ${err}`));
+                        }
+                    } else {
+                        reject(new Error(`RPC Error: ${err.message || err}`));
+                    }
+                } else if (!data || typeof data !== 'object') {
+                    console.warn(`Invalid response from Bitcoin Core for ${method}:`, data);
+                    resolve(null); // Don't crash on invalid responses
+                } else if (data.error) {
+                    reject(new Error(`Bitcoin Core Error: ${data.error.message}`));
                 } else {
                     resolve(data.result);
                 }

@@ -65,7 +65,7 @@ class RealStratumServer extends EventEmitter {
         const now = Date.now();
         
         // Cache difficulty for 60 seconds to reduce RPC load
-        if (this.cachedNetworkDifficulty && (now - this.lastDifficultyUpdate) < 60000) {
+        if (this.cachedNetworkDifficulty && (now - this.lastDifficultyUpdate) < 300000) {
             return this.cachedNetworkDifficulty;
         }
         
@@ -839,8 +839,3 @@ process.on('SIGINT', () => {
 });
 
 module.exports = RealStratumServer;
-
-// Add this after your existing server startup code
-const WebServer = require('./web-server');
-const webServer = new WebServer(server);
-webServer.start(3334);
