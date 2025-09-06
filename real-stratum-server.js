@@ -57,10 +57,25 @@ class RealStratumServer extends EventEmitter {
         });
     }
 
+    async getNetworkTarget() {
+        try {
+            const info = await this.bitcoin.callRpc('getblockchaininfo');
+            return info.difficulty;
+        } catch (error) {
+            console.error('Error getting network difficulty:', error);
+            return 73197670707408.73; // fallback
+        }
+    }
+
     async updateWork() {
         try {
             const job = await this.bitcoin.getBlockTemplate();
-            if (job) {
+            if (job && (!this.currentJob || job.height !== this.currentJob.height)) {
+                // Clear cached templates when new block arrives
+                if (this.currentJob) {
+                    delete this.currentJob.cachedCoinbaseTemplate;
+                }
+                
                 this.currentJob = job;
                 this.broadcastJob(job);
                 console.log(`New work created for block height ${job.height}`);
@@ -90,15 +105,20 @@ class RealStratumServer extends EventEmitter {
             address: socket.remoteAddress,
             shares: 0,
             validShares: 0,
-            connectTime: startTime  // Add this line
+            connectTime: startTime
         };
 
         this.miners.set(minerId, miner);
         console.log(`New connection: ${miner.address} (${minerId.substring(0, 8)})`);
 
+        // Set socket timeout to prevent hanging connections
+        socket.setTimeout(120000); // 2 minutes
+
         const keepAlive = setInterval(() => {
-            if (socket.writable) {
+            if (socket.writable && !socket.destroyed) {
                 socket.write('\n');
+            } else {
+                clearInterval(keepAlive);
             }
         }, 30000);        
 
@@ -110,20 +130,25 @@ class RealStratumServer extends EventEmitter {
             const duration = Date.now() - startTime;
             const avgTimePerShare = miner.shares > 0 ? duration / miner.shares : 0;
             console.log(`Connection lasted ${duration}ms, ${miner.shares} shares, ${avgTimePerShare.toFixed(0)}ms/share average`);
+            
+            // Cleanup
             clearInterval(keepAlive);
             this.miners.delete(minerId);
-            
-            // Force cleanup
             socket.removeAllListeners();
-            socket.destroy();
             
             console.log(`Miner disconnected: ${miner.address} (${minerId.substring(0, 8)}) - ${miner.validShares}/${miner.shares} valid shares`);
+        });
+
+        socket.on('timeout', () => {
+            console.log(`Socket timeout for ${miner.address}`);
+            socket.destroy();
         });
 
         socket.on('error', (err) => {
             clearInterval(keepAlive);
             console.error(`Socket error for ${miner.address}:`, err.message);
             this.miners.delete(minerId);
+            socket.destroy();
         });
     }
 
@@ -271,7 +296,6 @@ class RealStratumServer extends EventEmitter {
     }
 
     async validateShare(miner, jobId, extranonce2, time, nonce) {
-
         if (!this.currentJob) {
             console.error('No current job available for share validation');
             return false;
@@ -289,33 +313,32 @@ class RealStratumServer extends EventEmitter {
         }
 
         try {
-            const blockHeader = this.buildBlockHeader(miner, extranonce2, time, nonce);
+            // Use cached header template and only update nonce/time
+            const blockHeader = this.buildOptimizedBlockHeader(miner, extranonce2, time, nonce);
             const hash = this.calculateBlockHash(blockHeader);
-            const hashBuffer = Buffer.isBuffer(hash) ? hash : Buffer.from(hash, 'hex');
-            const reversedHash = hashBuffer.reverse();
+            const reversedHash = Buffer.from(hash).reverse();
 
             console.log(`Hash: ${reversedHash.toString('hex').substring(0, 20)}...`);
             
-            // Check pool difficulty (easy target for shares)
+            // Check pool difficulty
             const poolTarget = Buffer.from('ff00000000000000000000000000000000000000000000000000000000000000', 'hex');
             const meetsPoolDifficulty = reversedHash.compare(poolTarget) <= 0;
             
-        console.log(`Target: ${poolTarget.toString('hex').substring(0, 20)}...`);
-        console.log(`Meets pool difficulty: ${meetsPoolDifficulty}`);
+            console.log(`Meets pool difficulty: ${meetsPoolDifficulty}`);
 
-        // Check network difficulty (hard target for actual Bitcoin blocks)
-        const networkTarget = this.difficultyToTarget(this.getNetworkTarget());
-        const meetsNetworkDifficulty = reversedHash.compare(networkTarget) <= 0;
+            // Check network difficulty with real-time difficulty
+            const networkDifficulty = await this.getNetworkTarget();
+            const networkTarget = this.difficultyToTarget(networkDifficulty);
+            const meetsNetworkDifficulty = reversedHash.compare(networkTarget) <= 0;
 
-        console.log(`Meets network difficulty: ${meetsNetworkDifficulty}`);
+            console.log(`Meets network difficulty: ${meetsNetworkDifficulty}`);
 
-        if (meetsNetworkDifficulty) {
-            console.log('🎉 BLOCK FOUND! Hash:', reversedHash.toString('hex'));
-            // Submit the block to Bitcoin network
-            await this.submitFoundBlock(blockHeader, miner, extranonce2);
-        }
+            if (meetsNetworkDifficulty) {
+                console.log('🎉 BLOCK FOUND! Hash:', reversedHash.toString('hex'));
+                await this.submitFoundBlock(blockHeader, miner, extranonce2);
+            }
 
-        return meetsPoolDifficulty;
+            return meetsPoolDifficulty;
         } catch (error) {
             console.error('Validation error:', error.message);
             return false;
@@ -553,6 +576,60 @@ class RealStratumServer extends EventEmitter {
             return header;
         }
 
+        buildOptimizedBlockHeader(miner, extranonce2, time, nonce) {
+            const job = this.currentJob;
+            
+            // Use cached coinbase hash if available
+            if (!job.cachedCoinbaseTemplate) {
+                job.cachedCoinbaseTemplate = Buffer.concat([
+                    Buffer.from(job.coinb1, 'hex'),
+                    Buffer.from(miner.extranonce1, 'hex')
+                ]);
+            }
+            
+            // Construct coinbase with new extranonce2
+            const coinbase = Buffer.concat([
+                job.cachedCoinbaseTemplate,
+                Buffer.from(extranonce2, 'hex'),
+                Buffer.from(job.coinb2, 'hex')
+            ]);
+            
+            // Calculate coinbase hash
+            const coinbaseHash = this.doublesha256(coinbase);
+            
+            // Build merkle root with corrected algorithm
+            const merkleRoot = this.calculateCorrectMerkleRoot([coinbaseHash.toString('hex'), ...job.merkleSteps]);
+            
+            // Construct 80-byte block header
+            const header = Buffer.alloc(80);
+            let offset = 0;
+            
+            // Version (4 bytes, little endian)
+            header.writeUInt32LE(parseInt(job.version, 16), offset);
+            offset += 4;
+            
+            // Previous block hash (32 bytes) - job.prevHash is already reversed
+            Buffer.from(job.prevHash, 'hex').copy(header, offset);
+            offset += 32;
+            
+            // Merkle root (32 bytes, reverse byte order)
+            Buffer.from(merkleRoot, 'hex').reverse().copy(header, offset);
+            offset += 32;
+            
+            // Timestamp (4 bytes, little endian)
+            header.writeUInt32LE(parseInt(time, 16), offset);
+            offset += 4;
+            
+            // Difficulty bits (4 bytes, little endian)
+            header.writeUInt32LE(parseInt(job.nbits, 16), offset);
+            offset += 4;
+            
+            // Nonce (4 bytes, little endian)
+            header.writeUInt32LE(parseInt(nonce, 16), offset);
+            
+            return header;
+        }
+
         calculateBlockHash(header) {
             return this.doublesha256(header);
         }
@@ -576,6 +653,33 @@ class RealStratumServer extends EventEmitter {
                 for (let i = 0; i < level.length; i += 2) {
                     const left = Buffer.from(level[i], 'hex').reverse();
                     const right = level[i + 1] ? Buffer.from(level[i + 1], 'hex').reverse() : left;
+                    
+                    const combined = Buffer.concat([left, right]);
+                    const hash = this.doublesha256(combined);
+                    nextLevel.push(hash.reverse().toString('hex'));
+                }
+                
+                level = nextLevel;
+            }
+            
+            return level[0];
+        }
+
+        calculateCorrectMerkleRoot(hashes) {
+            if (hashes.length === 0) return '0'.repeat(64);
+            if (hashes.length === 1) return hashes[0];
+            
+            let level = hashes.slice();
+            
+            while (level.length > 1) {
+                const nextLevel = [];
+                
+                for (let i = 0; i < level.length; i += 2) {
+                    const left = Buffer.from(level[i], 'hex').reverse();
+                    // Bitcoin protocol: if odd number, duplicate the last hash
+                    const right = level[i + 1] ? 
+                        Buffer.from(level[i + 1], 'hex').reverse() : 
+                        Buffer.from(level[i], 'hex').reverse(); // Duplicate left
                     
                     const combined = Buffer.concat([left, right]);
                     const hash = this.doublesha256(combined);
@@ -631,61 +735,6 @@ class RealStratumServer extends EventEmitter {
             } catch (error) {
                 console.error('Error getting network difficulty:', error);
                 return 1;
-            }
-        }
-
-        async submitFoundBlock(blockHeader) {
-            try {
-                // Reconstruct full block with transactions
-                const blockHex = this.buildFullBlock(blockHeader);
-                
-                if (!blockHex) {
-                    console.log('Cannot submit block: full block construction not implemented');
-                    console.log('Block header found but missing transaction data');
-                    return null;
-                }
-                
-                const result = await this.bitcoin.callRpc('submitblock', [blockHex]);
-                
-                if (result === null) {
-                    console.log('Block accepted by network!');
-                    console.log('Block reward should arrive at:', this.bitcoin.poolAddress);
-                } else {
-                    console.log('Block rejected:', result);
-                }
-                
-                return result;
-            } catch (error) {
-                console.error('Error submitting block:', error);
-                return null;
-            }
-        }
-
-        buildFullBlock(header) {
-            try {
-                // Get the block template transactions
-                const transactions = this.currentJob.transactions || [];
-                
-                // Serialize block: header + transaction count + transactions
-                let blockHex = header.toString('hex');
-                
-                // Add transaction count (varint)
-                const txCount = transactions.length + 1; // +1 for coinbase
-                blockHex += this.encodeVarint(txCount);
-                
-                // Add coinbase transaction (reconstruct from coinb1 + extranonces + coinb2)
-                const coinbaseTx = this.reconstructCoinbase();
-                blockHex += coinbaseTx;
-                
-                // Add all other transactions
-                for (const tx of transactions) {
-                    blockHex += tx.data; // Transaction hex data from block template
-                }
-                
-                return blockHex;
-            } catch (error) {
-                console.error('Block construction error:', error);
-                return null;
             }
         }
 
