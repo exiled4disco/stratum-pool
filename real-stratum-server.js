@@ -373,7 +373,16 @@ class RealStratumServer extends EventEmitter {
             //    blockHashHex, 
             //    processingTime
             //);
-
+            this.shareQueue.push({
+                minerId: miner.id,
+                jobId,
+                nonce,
+                isValid: meetsPoolDifficulty,
+                meetsPoolDiff: meetsPoolDifficulty,
+                meetsNetworkDiff: meetsNetworkDifficulty,
+                blockHash: blockHashHex,
+                processingTime
+            }); 
             if (meetsNetworkDifficulty) {
                 console.log('BLOCK FOUND! Hash:', blockHashHex);
                 await this.db.logBlockFound(miner.id, blockHashHex, this.currentJob.height);
