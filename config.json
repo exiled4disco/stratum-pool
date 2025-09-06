@@ -1,0 +1,18 @@
+{
+  "stratum": {
+    "port": 3333,
+    "difficulty": 1
+  },
+  "bitcoin": {
+    "host": "127.0.0.1",
+    "port": 8332,
+    "username": "rpcuser",
+    "password": "rpcpass"
+  },
+  "database": {
+    "host": "localhost",
+    "user": "pool",
+    "password": "poolpass",
+    "database": "mining_pool"
+  }
+}
