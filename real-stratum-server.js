@@ -12,12 +12,16 @@ class RealStratumServer extends EventEmitter {
             poolAddress: config.poolAddress || '1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa',
             ...config
         };
-        
+       
         this.miners = new Map();
         this.server = net.createServer();
         this.jobCounter = 0;
         this.currentJob = null;
         
+        // Add these two lines here:
+        this.cachedNetworkDifficulty = null;
+        this.lastDifficultyUpdate = 0;
+       
         // Initialize Bitcoin connector
         this.bitcoin = new BitcoinConnector({
             host: '172.25.128.1',
@@ -26,7 +30,7 @@ class RealStratumServer extends EventEmitter {
             pass: '1234nN',
             poolAddress: this.config.poolAddress
         });
-        
+       
         this.setupServer();
         this.setupBitcoinEvents();
     }
@@ -58,12 +62,21 @@ class RealStratumServer extends EventEmitter {
     }
 
     async getNetworkTarget() {
+        const now = Date.now();
+        
+        // Cache difficulty for 60 seconds to reduce RPC load
+        if (this.cachedNetworkDifficulty && (now - this.lastDifficultyUpdate) < 60000) {
+            return this.cachedNetworkDifficulty;
+        }
+        
         try {
             const info = await this.bitcoin.callRpc('getblockchaininfo');
-            return info.difficulty;
+            this.cachedNetworkDifficulty = info.difficulty;
+            this.lastDifficultyUpdate = now;
+            return this.cachedNetworkDifficulty;
         } catch (error) {
             console.error('Error getting network difficulty:', error);
-            return 73197670707408.73; // fallback
+            return this.cachedNetworkDifficulty || 73197670707408.73; // Use cached or fallback
         }
     }
 
@@ -826,3 +839,8 @@ process.on('SIGINT', () => {
 });
 
 module.exports = RealStratumServer;
+
+// Add this after your existing server startup code
+const WebServer = require('./web-server');
+const webServer = new WebServer(server);
+webServer.start(3334);
