@@ -128,7 +128,7 @@ class RealStratumServer extends EventEmitter {
             socket: socket,
             subscribed: false,
             authorized: false,
-            difficulty: 0.000001,
+            difficulty: 1,
             lastActivity: Date.now(),
             address: socket.remoteAddress,
             shares: 0,
@@ -287,6 +287,7 @@ class RealStratumServer extends EventEmitter {
         
         miner.authorized = true;
         miner.username = username;
+        miner.difficulty = 1; // Force difficulty 1
         
         // Log to database
         this.db.logMinerConnection(miner.id, username, miner.address);
@@ -298,7 +299,11 @@ class RealStratumServer extends EventEmitter {
         };
 
         this.sendMessage(miner.socket, response);
-        console.log(`Miner authorized: ${username} from ${miner.address}`);
+        
+        // Force send new difficulty immediately
+        this.sendDifficulty(miner);
+        
+        console.log(`Miner authorized: ${username} from ${miner.address} - Set difficulty to ${miner.difficulty}`);
     }
 
     async handleSubmit(miner, id, params) {

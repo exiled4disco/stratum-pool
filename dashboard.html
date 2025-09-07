@@ -413,17 +413,9 @@
             }
             
             calculateHashrate(miners) {
-                // Count miners with actual activity  
-                let activeMiners = 0;
-                
-                miners.forEach(miner => {
-                    if (miner.is_connected && miner.total_shares > 0) {
-                        activeMiners++;
-                    }
-                });
-                
-                // Each S9 = ~14 TH/s
-                return activeMiners * 14;
+                // Don't calculate here - use the exact value from the API
+                console.log('Frontend: Using hashrate from API instead of calculating');
+                return 0; // This will be overridden by API data
             }
             
             updateEfficiencyBar(efficiency) {
@@ -490,8 +482,9 @@
                 document.getElementById('networkDifficulty').textContent = this.formatDifficulty(stats.networkDifficulty);
                 
                 // Calculate and update hashrate
-                const hashrate = this.calculateHashrate(data.miners);
-                document.getElementById('totalHashrate').textContent = `${hashrate.toFixed(1)} TH/s`;
+                const hashrate = parseFloat(stats.estimatedHashrate) || 0;
+                console.log('Frontend: Using API hashrate:', hashrate, 'TH/s');
+                document.getElementById('totalHashrate').textContent = `${hashrate} TH/s`;
                 
                 // Update efficiency bar
                 this.updateEfficiencyBar(stats.efficiency);
