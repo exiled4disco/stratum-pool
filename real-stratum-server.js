@@ -383,8 +383,10 @@ class RealStratumServer extends EventEmitter {
             console.log(`Hash: ${blockHashHex.substring(0, 20)}...`);
             
             // Check pool difficulty
-            const poolTarget = Buffer.from('0000100000000000000000000000000000000000000000000000000000000000', 'hex');
-
+            const poolTarget = this.difficultyToTarget(miner.difficulty);
+            console.log(`DEBUG: Miner ${miner.username} difficulty: ${miner.difficulty}`);
+            console.log(`DEBUG: Pool target: ${poolTarget.toString('hex').substring(0, 20)}...`);
+            console.log(`DEBUG: Hash target:  ${reversedHash.toString('hex').substring(0, 20)}...`);
             const meetsPoolDifficulty = reversedHash.compare(poolTarget) <= 0;
             
             console.log(`Meets pool difficulty: ${meetsPoolDifficulty}`);
@@ -802,13 +804,11 @@ class RealStratumServer extends EventEmitter {
             difficulty = 1;
         }
         
+        // Bitcoin's maximum target (difficulty 1)
         const maxTarget = BigInt('0x00000000FFFF0000000000000000000000000000000000000000000000000000');
         
-        // Convert difficulty to integer to avoid floating point issues
-        const difficultyInt = Math.floor(difficulty * 1000000); // Scale up to avoid decimals
-        const scaledMaxTarget = maxTarget * BigInt(1000000); // Scale max target accordingly
-        
-        const target = scaledMaxTarget / BigInt(difficultyInt);
+        // Simple division - no scaling needed
+        const target = maxTarget / BigInt(Math.floor(difficulty));
         
         // Convert to 32-byte buffer
         const targetHex = target.toString(16).padStart(64, '0');
