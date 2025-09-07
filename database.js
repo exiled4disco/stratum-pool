@@ -46,17 +46,19 @@ class DatabaseConnector {
         try {
             const result = await this.pool.query(
                 `INSERT INTO shares (miner_id, job_id, nonce, is_valid, meets_pool_difficulty, meets_network_difficulty, block_hash, processing_time_ms) 
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
                 [minerId, jobId, nonce, isValid, meetsPoolDiff, meetsNetworkDiff, blockHash, processingTime]
             );
             
-            // Update miner totals
             await this.pool.query(
                 'UPDATE miners SET total_shares = total_shares + 1, valid_shares = valid_shares + $2 WHERE id = $1',
                 [minerId, isValid ? 1 : 0]
             );
             
-            console.log(`📊 DB: Share #${result.rows[0].id} logged - Valid: ${isValid}, Network: ${meetsNetworkDiff}`);
+            // Only log blocks or errors
+            if (meetsNetworkDiff) {
+                console.log(`🎉 BLOCK FOUND - Share #${result.rows[0].id}`);
+            }
         } catch (error) {
             console.error('Error logging share:', error);
         }
