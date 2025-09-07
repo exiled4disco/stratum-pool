@@ -204,7 +204,7 @@ class RealStratumServer extends EventEmitter {
             this.miners.delete(minerId);
             socket.removeAllListeners();
             
-            console.log(`Miner disconnected: ${miner.address} (${minerId.substring(0, 8)}) - ${miner.validShares}/${miner.shares} valid shares`);
+            //console.log(`Miner disconnected: ${miner.address} (${minerId.substring(0, 8)}) - ${miner.validShares}/${miner.shares} valid shares`);
         });
 
         socket.on('timeout', () => {
@@ -815,7 +815,7 @@ class RealStratumServer extends EventEmitter {
                             share.processingTime
                         );
                     }
-                    console.log(`📊 DB: Logged ${batch.length} shares in batch`);
+                    // console.log(`📊 DB: Logged ${batch.length} shares in batch`);
                 } catch (error) {
                     console.error('Batch logging error:', error);
                 }
@@ -965,7 +965,7 @@ server.start().then(success => {
 // Display stats every 60 seconds
 setInterval(async () => {
     const stats = server.getStats();
-    console.log(`📊 Stats: ${stats.totalMiners} miners, ${stats.validShares}/${stats.totalShares} shares (${stats.efficiency}% efficiency) - Queue: ${server.shareQueue.length}`);
+    // console.log(`📊 Stats: ${stats.totalMiners} miners, ${stats.validShares}/${stats.totalShares} shares (${stats.efficiency}% efficiency) - Queue: ${server.shareQueue.length}`);
    
     // Log to database every 60 seconds as well
     await server.db.logPoolStats(
