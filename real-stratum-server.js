@@ -174,20 +174,21 @@ class DynamicDifficultyManager {
 this.difficultyManager = new DynamicDifficultyManager();
 
 // In handleAuthorize, replace the static difficulty assignment:
-handleAuthorize(miner, id, params) {
-    const [username, password] = params;
+function getInitialDifficulty(username) {
+    const name = username.toLowerCase();
     
-    miner.authorized = true;
-    miner.username = username;
+    if (name.includes('nano') || name.includes('avalon')) {
+        return 2048;  // 6 TH/s Avalon Nano S
+    }
+    if (name.includes('s9')) {
+        return 4096;  // 13.5 TH/s S9
+    }
     
-    // Dynamic difficulty based on estimated hardware
-    const estimatedHashrate = this.difficultyManager.getHardwareHashrateEstimate(miner);
-    miner.difficulty = this.difficultyManager.calculateTargetDifficulty(estimatedHashrate);
-    
-    console.log(`🔐 ${username} authorized with initial difficulty ${miner.difficulty} (~${(estimatedHashrate/1e12).toFixed(1)} TH/s)`);
-    
-    // ... rest of your existing code
+    // Default for unknown miners
+    return 2048;
 }
+
+miner.difficulty = getInitialDifficulty(username);
 
 // In validateShare, record the share for difficulty tracking:
 if (isValid) {
