@@ -236,6 +236,15 @@ class EnhancedDashboard {
             LIMIT 20
         `);
 
+        const recentSharesResult = await this.pool.query(`
+            SELECT 
+                COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '1 minute' THEN 1 END) as shares_last_minute,
+                COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '5 minutes' THEN 1 END) as shares_last_5min
+            FROM shares
+        `);
+
+        
+
         // Get blocks found with details
         const blocksResult = await this.pool.query(`
             SELECT 
@@ -246,17 +255,17 @@ class EnhancedDashboard {
             ORDER BY b.found_at DESC
             LIMIT 10
         `);
-
+        
+        const recentShares = recentSharesResult.rows[0];
         const shares = sharesResult.rows[0];
         const allTime = allTimeResult.rows[0];
         const poolStats = poolStatsResult.rows[0] || {};       
         const efficiency = shares.total_shares_today > 0 ? 
-            ((shares.valid_shares_today / shares.total_shares_today) * 100).toFixed(1) : '0.0';
-        
+            ((shares.valid_shares_today / shares.total_shares_today) * 100).toFixed(1) : '0.0';       
         const allTimeEfficiency = allTime.total_shares_all_time > 0 ? 
             ((allTime.valid_shares_all_time / allTime.total_shares_all_time) * 100).toFixed(1) : '0.0';
-        const sharesPerMinute = shares.shares_last_hour > 0 ? (shares.shares_last_hour / 60).toFixed(1) : '0.0';
-        const estimatedHashrate = this.calculateEstimatedHashrate(minersResult.rows, shares.shares_last_hour);
+        const sharesPerMinute = recentShares.shares_last_5min > 0 ? 
+            (recentShares.shares_last_5min / 5).toFixed(1) : '0.0';
         const uptimePercent = this.calculateUptimePercent(minersResult.rows);
 
     console.log('=== API RESPONSE DEBUG ===');
@@ -283,6 +292,8 @@ class EnhancedDashboard {
             sharesLastHour: parseInt(shares.shares_last_hour) || 0,
             estimatedHashrate: parseFloat(estimatedHashrate),
             uptimePercent: uptimePercent,
+            rejectionRate: shares.total_shares_today > 0 ? 
+                ((shares.rejected_shares_today / shares.total_shares_today) * 100).toFixed(1) : '0.0',
             lastShareTime: allTime.last_share_time
         },
             recentActivity: activityResult.rows,

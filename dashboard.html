@@ -495,6 +495,8 @@
                 // Calculate shares per minute (rough estimate)
                 const sharesPerMin = stats.sharesLastHour > 0 ? (stats.sharesLastHour / 60).toFixed(1) : '0.0';
                 document.getElementById('sharesPerMinute').textContent = sharesPerMin;
+                document.getElementById('rejectionRate').textContent = data.stats.rejectionRate + '%';
+
                 
                 // Update miners list
                 this.updateMinersList(data.miners);
@@ -589,16 +591,72 @@
                 const canvas = document.getElementById(canvasId);
                 const ctx = canvas.getContext('2d');
                 
-                ctx.fillStyle = 'rgba(255, 255, 255, 0.1)';
+                // Clear canvas
+                ctx.fillStyle = 'rgba(30, 60, 114, 0.8)';
                 ctx.fillRect(0, 0, canvas.width, canvas.height);
                 
-                ctx.fillStyle = '#f7931a';
-                ctx.font = '16px Arial';
-                ctx.textAlign = 'center';
-                ctx.fillText(title, canvas.width / 2, canvas.height / 2);
-                ctx.fillText('Chart data coming soon...', canvas.width / 2, canvas.height / 2 + 25);
+                if (canvasId === 'hashrateChart') {
+                    // Simple hashrate visualization
+                    this.drawSimpleHashrateChart(ctx, canvas);
+                } else if (canvasId === 'shareChart') {
+                    // Simple share distribution
+                    this.drawSimpleShareChart(ctx, canvas);
+                }
             }
             
+            drawSimpleHashrateChart(ctx, canvas) {
+                const hashrate = parseFloat(document.getElementById('totalHashrate').textContent) || 0;
+                const maxHashrate = 100; // TH/s scale
+                
+                // Draw simple bar
+                const barHeight = (hashrate / maxHashrate) * (canvas.height - 60);
+                ctx.fillStyle = '#f7931a';
+                ctx.fillRect(50, canvas.height - barHeight - 30, 50, barHeight);
+                
+                // Labels
+                ctx.fillStyle = 'white';
+                ctx.font = '14px Arial';
+                ctx.fillText(`${hashrate} TH/s`, 50, canvas.height - 10);
+                ctx.fillText('Current Hashrate', 10, 20);
+            }
+
+            drawSimpleShareChart(ctx, canvas) {
+                const validShares = parseInt(document.getElementById('validShares').textContent) || 0;
+                const totalShares = parseInt(document.getElementById('totalShares').textContent) || 0;
+                const rejectedShares = totalShares - validShares;
+                
+                if (totalShares > 0) {
+                    // Simple pie chart
+                    const centerX = canvas.width / 2;
+                    const centerY = canvas.height / 2;
+                    const radius = 60;
+                    
+                    const validAngle = (validShares / totalShares) * 2 * Math.PI;
+                    
+                    // Valid shares (green)
+                    ctx.beginPath();
+                    ctx.arc(centerX, centerY, radius, 0, validAngle);
+                    ctx.lineTo(centerX, centerY);
+                    ctx.fillStyle = '#10b981';
+                    ctx.fill();
+                    
+                    // Rejected shares (red)
+                    if (rejectedShares > 0) {
+                        ctx.beginPath();
+                        ctx.arc(centerX, centerY, radius, validAngle, 2 * Math.PI);
+                        ctx.lineTo(centerX, centerY);
+                        ctx.fillStyle = '#ef4444';
+                        ctx.fill();
+                    }
+                    
+                    // Labels
+                    ctx.fillStyle = 'white';
+                    ctx.font = '12px Arial';
+                    ctx.fillText(`Valid: ${validShares}`, 10, 20);
+                    ctx.fillText(`Rejected: ${rejectedShares}`, 10, 35);
+                }
+            }
+
             updateCharts(data) {
                 // Store data for chart updates
                 this.hashrateHistory.push({
