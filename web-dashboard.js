@@ -278,14 +278,21 @@ class EnhancedDashboard {
     }
 
     calculateEstimatedHashrate(miners, sharesLastHour) {
-        // Count connected miners with recent activity
-        const activeMiners = miners.filter(m => m.is_connected && m.total_shares > 0).length;
+        console.log('=== HASHRATE CALCULATION DEBUG ===');
+        console.log('Total miners received:', miners.length);
         
-        if (activeMiners > 0) {
-            return (activeMiners * 14).toFixed(1); // 14 TH/s per S9
-        }
+        // Just count connected miners - simple and reliable
+        const connectedMiners = miners.filter(m => {
+            console.log(`Miner ${m.username}: connected=${m.is_connected}, shares=${m.total_shares}`);
+            return m.is_connected === true;
+        }).length;
         
-        return "0.0";
+        console.log('Connected miners count:', connectedMiners);
+        const hashrate = (connectedMiners * 14).toFixed(1);
+        console.log('Calculated hashrate:', hashrate, 'TH/s');
+        console.log('=== END HASHRATE DEBUG ===');
+        
+        return hashrate;
     }
 
     calculateUptimePercent(miners) {
