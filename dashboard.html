@@ -413,16 +413,17 @@
             }
             
             calculateHashrate(miners) {
-                // Estimate hashrate based on shares and difficulty
-                // This is an approximation - for accurate measurement, you'd need share timestamps
-                let totalHashrate = 0;
+                // Count miners with actual activity  
+                let activeMiners = 0;
+                
                 miners.forEach(miner => {
                     if (miner.is_connected && miner.total_shares > 0) {
-                        // Rough estimate: 14 TH/s for S9 based on typical share rates
-                        totalHashrate += 14; // You can make this more sophisticated
+                        activeMiners++;
                     }
                 });
-                return totalHashrate;
+                
+                // Each S9 = ~14 TH/s
+                return activeMiners * 14;
             }
             
             updateEfficiencyBar(efficiency) {
@@ -499,7 +500,7 @@
                 document.getElementById('avgProcessingTime').textContent = `${(stats.avgProcessingTime || 0).toFixed(1)}ms`;
                 
                 // Calculate shares per minute (rough estimate)
-                const sharesPerMin = Math.round(stats.totalShares / (Date.now() / 1000 / 60) || 0);
+                const sharesPerMin = stats.sharesLastHour > 0 ? (stats.sharesLastHour / 60).toFixed(1) : '0.0';
                 document.getElementById('sharesPerMinute').textContent = sharesPerMin;
                 
                 // Update miners list

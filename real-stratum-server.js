@@ -5,7 +5,6 @@ const BitcoinConnector = require('./bitcoin-connector');
 const DatabaseConnector = require('./database');
 const MiningPoolMonitor = require('./monitoring-system');
 
-
 class RealStratumServer extends EventEmitter {
     constructor(config = {}) {
         super();
@@ -21,7 +20,7 @@ class RealStratumServer extends EventEmitter {
         this.jobCounter = 0;
         this.currentJob = null;
         
-        // Add these two lines here:
+        // Add these lines for caching and batching:
         this.cachedNetworkDifficulty = null;
         this.lastDifficultyUpdate = 0;
         this.shareQueue = [];
@@ -40,6 +39,12 @@ class RealStratumServer extends EventEmitter {
         this.db = new DatabaseConnector();
         this.startBatchProcessor();
 
+        // Initialize the monitoring system
+        this.monitor = new MiningPoolMonitor({
+            checkInterval: 30000,      // Check every 30 seconds
+            alertCooldown: 300000,     // 5 minute cooldown between duplicate alerts
+            logFile: './logs/mining-monitor.log'
+        });
     }
 
     async start() {
@@ -55,6 +60,9 @@ class RealStratumServer extends EventEmitter {
             console.log(`Pool address: ${this.config.poolAddress}`);
             console.log(`Connected to Bitcoin node successfully`);
         });
+
+        // Start the monitoring system
+        await this.monitor.start();
 
         // Get initial work
         await this.updateWork();
@@ -131,6 +139,9 @@ class RealStratumServer extends EventEmitter {
         this.miners.set(minerId, miner);
         console.log(`New connection: ${miner.address} (${minerId.substring(0, 8)})`);
 
+        // Record miner connection for monitoring
+        this.monitor.recordMinerConnection(minerId, 'new-connection', socket.remoteAddress);
+
         // Set socket timeout to prevent hanging connections
         socket.setTimeout(120000); // 2 minutes
 
@@ -153,6 +164,9 @@ class RealStratumServer extends EventEmitter {
             
             // Log disconnection to database
             this.db.logMinerDisconnection(miner.id);
+            
+            // Record miner disconnection for monitoring
+            this.monitor.recordMinerDisconnection(miner.id, miner.username || 'unknown');
             
             // Cleanup
             clearInterval(keepAlive);
@@ -298,7 +312,7 @@ class RealStratumServer extends EventEmitter {
         
         console.log(`Share submitted by ${username}: job=${jobId}, nonce=${nonce}`);
         
-        // For now, accept all shares - real validation would check proof-of-work
+        // Validate the share
         const isValid = await this.validateShare(miner, jobId, extranonce2, time, nonce);
         
         if (isValid) {
@@ -364,17 +378,7 @@ class RealStratumServer extends EventEmitter {
             // Calculate processing time
             const processingTime = Date.now() - startTime;
 
-            // Log to database
-            //await this.db.logShare(
-            //    miner.id, 
-            //    jobId, 
-            //    nonce, 
-            //    meetsPoolDifficulty, 
-            //    meetsPoolDifficulty, 
-            //    meetsNetworkDifficulty, 
-            //    blockHashHex, 
-            //    processingTime
-            //);
+            // Queue share for batch database logging
             this.shareQueue.push({
                 minerId: miner.id,
                 jobId,
@@ -384,9 +388,13 @@ class RealStratumServer extends EventEmitter {
                 meetsNetworkDiff: meetsNetworkDifficulty,
                 blockHash: blockHashHex,
                 processingTime
-            }); 
+            });
+
+            // Record share validation for monitoring
+            this.monitor.recordShareValidation(miner.id, meetsPoolDifficulty, processingTime);
+            
             if (meetsNetworkDifficulty) {
-                console.log('BLOCK FOUND! Hash:', blockHashHex);
+                console.log('🎉 BLOCK FOUND! Hash:', blockHashHex);
                 await this.db.logBlockFound(miner.id, blockHashHex, this.currentJob.height);
                 await this.submitFoundBlock(blockHeader, miner, extranonce2);
             }
@@ -550,9 +558,12 @@ class RealStratumServer extends EventEmitter {
                 console.log('Block reward (3.125 BTC + fees) will arrive at:', this.bitcoin.poolAddress);
                 console.log('Block hex:', blockHex.slice(0, 160) + '...');
                 
+                // Record block submission for monitoring
+                const blockHash = this.calculateBlockHash(blockHeader).reverse().toString('hex');
+                this.monitor.recordBlockSubmission(blockHash, this.currentJob.height, miner.id);
+                
                 // Log to file for permanent record
                 const timestamp = new Date().toISOString();
-                const blockHash = this.calculateBlockHash(blockHeader).reverse().toString('hex');
                 const logEntry = `${timestamp}: BLOCK FOUND - Hash: ${blockHash}, Size: ${blockHex.length / 2} bytes\n`;
                 
                 require('fs').appendFileSync('./logs/blocks-found.log', logEntry);
@@ -582,205 +593,206 @@ class RealStratumServer extends EventEmitter {
             return null;
         }
     }
-        buildBlockHeader(miner, extranonce2, time, nonce) {
-            const job = this.currentJob;
-            
-            // Construct coinbase transaction with miner's extranonce
-            const coinbase = Buffer.concat([
+
+    buildBlockHeader(miner, extranonce2, time, nonce) {
+        const job = this.currentJob;
+        
+        // Construct coinbase transaction with miner's extranonce
+        const coinbase = Buffer.concat([
+            Buffer.from(job.coinb1, 'hex'),
+            Buffer.from(miner.extranonce1, 'hex'),
+            Buffer.from(extranonce2, 'hex'),
+            Buffer.from(job.coinb2, 'hex')
+        ]);
+        
+        // Calculate coinbase hash
+        const coinbaseHash = this.doublesha256(coinbase);
+        
+        // Build merkle root
+        const merkleRoot = this.calculateCorrectMerkleRoot([coinbaseHash.toString('hex'), ...job.merkleSteps]);
+        
+        // Construct 80-byte block header
+        const header = Buffer.alloc(80);
+        let offset = 0;
+        
+        // Version (4 bytes, little endian)
+        header.writeUInt32LE(parseInt(job.version, 16), offset);
+        offset += 4;
+        
+        // Previous block hash (32 bytes, reverse byte order)
+        Buffer.from(job.prevHash, 'hex').reverse().copy(header, offset);
+        offset += 32;
+        
+        // Merkle root (32 bytes, reverse byte order)
+        Buffer.from(merkleRoot, 'hex').reverse().copy(header, offset);
+        offset += 32;
+        
+        // Timestamp (4 bytes, little endian)
+        header.writeUInt32LE(parseInt(time, 16), offset);
+        offset += 4;
+        
+        // Difficulty bits (4 bytes, little endian)
+        header.writeUInt32LE(parseInt(job.nbits, 16), offset);
+        offset += 4;
+        
+        // Nonce (4 bytes, little endian)
+        header.writeUInt32LE(parseInt(nonce, 16), offset);
+        
+        return header;
+    }
+
+    buildOptimizedBlockHeader(miner, extranonce2, time, nonce) {
+        const job = this.currentJob;
+        
+        // Use cached coinbase hash if available
+        if (!job.cachedCoinbaseTemplate) {
+            job.cachedCoinbaseTemplate = Buffer.concat([
                 Buffer.from(job.coinb1, 'hex'),
-                Buffer.from(miner.extranonce1, 'hex'),
-                Buffer.from(extranonce2, 'hex'),
-                Buffer.from(job.coinb2, 'hex')
+                Buffer.from(miner.extranonce1, 'hex')
             ]);
-            
-            // Calculate coinbase hash
-            const coinbaseHash = this.doublesha256(coinbase);
-            
-            // Build merkle root
-            const merkleRoot = this.calculateCorrectMerkleRoot([coinbaseHash.toString('hex'), ...job.merkleSteps]);
-            
-            // Construct 80-byte block header
-            const header = Buffer.alloc(80);
-            let offset = 0;
-            
-            // Version (4 bytes, little endian)
-            header.writeUInt32LE(parseInt(job.version, 16), offset);
-            offset += 4;
-            
-            // Previous block hash (32 bytes, reverse byte order)
-            Buffer.from(job.prevHash, 'hex').reverse().copy(header, offset);
-            offset += 32;
-            
-            // Merkle root (32 bytes, reverse byte order)
-            Buffer.from(merkleRoot, 'hex').reverse().copy(header, offset);
-            offset += 32;
-            
-            // Timestamp (4 bytes, little endian)
-            header.writeUInt32LE(parseInt(time, 16), offset);
-            offset += 4;
-            
-            // Difficulty bits (4 bytes, little endian)
-            header.writeUInt32LE(parseInt(job.nbits, 16), offset);
-            offset += 4;
-            
-            // Nonce (4 bytes, little endian)
-            header.writeUInt32LE(parseInt(nonce, 16), offset);
-            
-            return header;
         }
+        
+        // Construct coinbase with new extranonce2
+        const coinbase = Buffer.concat([
+            job.cachedCoinbaseTemplate,
+            Buffer.from(extranonce2, 'hex'),
+            Buffer.from(job.coinb2, 'hex')
+        ]);
+        
+        // Calculate coinbase hash
+        const coinbaseHash = this.doublesha256(coinbase);
+        
+        // Build merkle root with corrected algorithm
+        const merkleRoot = this.calculateCorrectMerkleRoot([coinbaseHash.toString('hex'), ...job.merkleSteps]);
+        
+        // Construct 80-byte block header
+        const header = Buffer.alloc(80);
+        let offset = 0;
+        
+        // Version (4 bytes, little endian)
+        header.writeUInt32LE(parseInt(job.version, 16), offset);
+        offset += 4;
+        
+        // Previous block hash (32 bytes) - job.prevHash is already reversed
+        Buffer.from(job.prevHash, 'hex').copy(header, offset);
+        offset += 32;
+        
+        // Merkle root (32 bytes, reverse byte order)
+        Buffer.from(merkleRoot, 'hex').reverse().copy(header, offset);
+        offset += 32;
+        
+        // Timestamp (4 bytes, little endian)
+        header.writeUInt32LE(parseInt(time, 16), offset);
+        offset += 4;
+        
+        // Difficulty bits (4 bytes, little endian)
+        header.writeUInt32LE(parseInt(job.nbits, 16), offset);
+        offset += 4;
+        
+        // Nonce (4 bytes, little endian)
+        header.writeUInt32LE(parseInt(nonce, 16), offset);
+        
+        return header;
+    }
 
-        buildOptimizedBlockHeader(miner, extranonce2, time, nonce) {
-            const job = this.currentJob;
+    calculateBlockHash(header) {
+        return this.doublesha256(header);
+    }
+
+    doublesha256(data) {
+        const crypto = require('crypto');
+        const hash1 = crypto.createHash('sha256').update(data).digest();
+        const hash2 = crypto.createHash('sha256').update(hash1).digest();
+        return hash2;
+    }
+
+    calculateCorrectMerkleRoot(hashes) {
+        if (hashes.length === 0) return '0'.repeat(64);
+        if (hashes.length === 1) return hashes[0];
+        
+        let level = hashes.slice();
+        
+        while (level.length > 1) {
+            const nextLevel = [];
             
-            // Use cached coinbase hash if available
-            if (!job.cachedCoinbaseTemplate) {
-                job.cachedCoinbaseTemplate = Buffer.concat([
-                    Buffer.from(job.coinb1, 'hex'),
-                    Buffer.from(miner.extranonce1, 'hex')
-                ]);
+            for (let i = 0; i < level.length; i += 2) {
+                const left = Buffer.from(level[i], 'hex').reverse();
+                // Bitcoin protocol: if odd number, duplicate the last hash
+                const right = level[i + 1] ? 
+                    Buffer.from(level[i + 1], 'hex').reverse() : 
+                    Buffer.from(level[i], 'hex').reverse(); // Duplicate left
+                
+                const combined = Buffer.concat([left, right]);
+                const hash = this.doublesha256(combined);
+                nextLevel.push(hash.reverse().toString('hex'));
             }
             
-            // Construct coinbase with new extranonce2
-            const coinbase = Buffer.concat([
-                job.cachedCoinbaseTemplate,
-                Buffer.from(extranonce2, 'hex'),
-                Buffer.from(job.coinb2, 'hex')
-            ]);
-            
-            // Calculate coinbase hash
-            const coinbaseHash = this.doublesha256(coinbase);
-            
-            // Build merkle root with corrected algorithm
-            const merkleRoot = this.calculateCorrectMerkleRoot([coinbaseHash.toString('hex'), ...job.merkleSteps]);
-            
-            // Construct 80-byte block header
-            const header = Buffer.alloc(80);
-            let offset = 0;
-            
-            // Version (4 bytes, little endian)
-            header.writeUInt32LE(parseInt(job.version, 16), offset);
-            offset += 4;
-            
-            // Previous block hash (32 bytes) - job.prevHash is already reversed
-            Buffer.from(job.prevHash, 'hex').copy(header, offset);
-            offset += 32;
-            
-            // Merkle root (32 bytes, reverse byte order)
-            Buffer.from(merkleRoot, 'hex').reverse().copy(header, offset);
-            offset += 32;
-            
-            // Timestamp (4 bytes, little endian)
-            header.writeUInt32LE(parseInt(time, 16), offset);
-            offset += 4;
-            
-            // Difficulty bits (4 bytes, little endian)
-            header.writeUInt32LE(parseInt(job.nbits, 16), offset);
-            offset += 4;
-            
-            // Nonce (4 bytes, little endian)
-            header.writeUInt32LE(parseInt(nonce, 16), offset);
-            
-            return header;
+            level = nextLevel;
         }
+        
+        return level[0];
+    }
 
-        calculateBlockHash(header) {
-            return this.doublesha256(header);
-        }
-
-        doublesha256(data) {
-            const crypto = require('crypto');
-            const hash1 = crypto.createHash('sha256').update(data).digest();
-            const hash2 = crypto.createHash('sha256').update(hash1).digest();
-            return hash2;
-        }
-
-        calculateCorrectMerkleRoot(hashes) {
-            if (hashes.length === 0) return '0'.repeat(64);
-            if (hashes.length === 1) return hashes[0];
-            
-            let level = hashes.slice();
-            
-            while (level.length > 1) {
-                const nextLevel = [];
-                
-                for (let i = 0; i < level.length; i += 2) {
-                    const left = Buffer.from(level[i], 'hex').reverse();
-                    // Bitcoin protocol: if odd number, duplicate the last hash
-                    const right = level[i + 1] ? 
-                        Buffer.from(level[i + 1], 'hex').reverse() : 
-                        Buffer.from(level[i], 'hex').reverse(); // Duplicate left
-                    
-                    const combined = Buffer.concat([left, right]);
-                    const hash = this.doublesha256(combined);
-                    nextLevel.push(hash.reverse().toString('hex'));
-                }
-                
-                level = nextLevel;
-            }
-            
-            return level[0];
-        }
-
-        startBatchProcessor() {
-            setInterval(async () => {
-                if (this.shareQueue.length > 0) {
-                    const batch = this.shareQueue.splice(0, 100);
-                    try {
-                        for (const share of batch) {
-                            await this.db.logShare(
-                                share.minerId,
-                                share.jobId,
-                                share.nonce,
-                                share.isValid,
-                                share.meetsPoolDiff,
-                                share.meetsNetworkDiff,
-                                share.blockHash,
-                                share.processingTime
-                            );
-                        }
-                        console.log(`📊 DB: Logged ${batch.length} shares in batch`);
-                    } catch (error) {
-                        console.error('Batch logging error:', error);
+    startBatchProcessor() {
+        setInterval(async () => {
+            if (this.shareQueue.length > 0) {
+                const batch = this.shareQueue.splice(0, 100);
+                try {
+                    for (const share of batch) {
+                        await this.db.logShare(
+                            share.minerId,
+                            share.jobId,
+                            share.nonce,
+                            share.isValid,
+                            share.meetsPoolDiff,
+                            share.meetsNetworkDiff,
+                            share.blockHash,
+                            share.processingTime
+                        );
                     }
+                    console.log(`📊 DB: Logged ${batch.length} shares in batch`);
+                } catch (error) {
+                    console.error('Batch logging error:', error);
                 }
-            }, 5000);
-        }
-
-        checkDifficulty(hash, target) {
-            try {
-                const targetBuffer = this.difficultyToTarget(target);
-                console.log(`DEBUG: Target for difficulty ${target}: ${targetBuffer.toString('hex')}`);
-                
-                const hashCopy = Buffer.from(hash);
-                const result = hashCopy.reverse().compare(targetBuffer) <= 0;
-                console.log(`DEBUG: Hash reversed: ${hashCopy.toString('hex')}`);
-                console.log(`DEBUG: Comparison result: ${result}`);
-                
-                return result;
-            } catch (error) {
-                console.error('Difficulty check error:', error.message);
-                return false;
             }
-        }
+        }, 5000);
+    }
 
-        difficultyToTarget(difficulty) {
-            // Handle edge cases
-            if (difficulty <= 0) {
-                difficulty = 1;
-            }
+    checkDifficulty(hash, target) {
+        try {
+            const targetBuffer = this.difficultyToTarget(target);
+            console.log(`DEBUG: Target for difficulty ${target}: ${targetBuffer.toString('hex')}`);
             
-            const maxTarget = BigInt('0x00000000FFFF0000000000000000000000000000000000000000000000000000');
+            const hashCopy = Buffer.from(hash);
+            const result = hashCopy.reverse().compare(targetBuffer) <= 0;
+            console.log(`DEBUG: Hash reversed: ${hashCopy.toString('hex')}`);
+            console.log(`DEBUG: Comparison result: ${result}`);
             
-            // Convert difficulty to integer to avoid floating point issues
-            const difficultyInt = Math.floor(difficulty * 1000000); // Scale up to avoid decimals
-            const scaledMaxTarget = maxTarget * BigInt(1000000); // Scale max target accordingly
-            
-            const target = scaledMaxTarget / BigInt(difficultyInt);
-            
-            // Convert to 32-byte buffer
-            const targetHex = target.toString(16).padStart(64, '0');
-            return Buffer.from(targetHex, 'hex');
+            return result;
+        } catch (error) {
+            console.error('Difficulty check error:', error.message);
+            return false;
         }
+    }
+
+    difficultyToTarget(difficulty) {
+        // Handle edge cases
+        if (difficulty <= 0) {
+            difficulty = 1;
+        }
+        
+        const maxTarget = BigInt('0x00000000FFFF0000000000000000000000000000000000000000000000000000');
+        
+        // Convert difficulty to integer to avoid floating point issues
+        const difficultyInt = Math.floor(difficulty * 1000000); // Scale up to avoid decimals
+        const scaledMaxTarget = maxTarget * BigInt(1000000); // Scale max target accordingly
+        
+        const target = scaledMaxTarget / BigInt(difficultyInt);
+        
+        // Convert to 32-byte buffer
+        const targetHex = target.toString(16).padStart(64, '0');
+        return Buffer.from(targetHex, 'hex');
+    }
 
     sendDifficulty(miner) {
         const message = {
@@ -884,30 +896,44 @@ server.start().then(success => {
     }
 });
 
-// Update work every 30 seconds
-//setInterval(async () => {
-//    await server.updateWork();
-// }, 30000);
-
 // Display stats every 60 seconds
 setInterval(async () => {
     const stats = server.getStats();
     console.log(`📊 Stats: ${stats.totalMiners} miners, ${stats.validShares}/${stats.totalShares} shares (${stats.efficiency}% efficiency) - Queue: ${server.shareQueue.length}`);
    
-   // Log to database every 60 seconds as well
-   await server.db.logPoolStats(
-       stats.totalMiners,
-       stats.totalShares,
-       stats.validShares,
-       parseFloat(stats.efficiency),
-       server.currentJob?.height || 0,
-       server.cachedNetworkDifficulty || 0
-   );
+    // Log to database every 60 seconds as well
+    await server.db.logPoolStats(
+        stats.totalMiners,
+        stats.totalShares,
+        stats.validShares,
+        parseFloat(stats.efficiency),
+        server.currentJob?.height || 0,
+        server.cachedNetworkDifficulty || 0
+    );
 }, 60000);
 
 // Graceful shutdown
 process.on('SIGINT', () => {
     console.log('\nShutting down real stratum server...');
+    
+    // Stop the monitor gracefully
+    if (server.monitor) {
+        server.monitor.stop();
+    }
+    
+    server.server.close(() => {
+        process.exit(0);
+    });
+});
+
+process.on('SIGTERM', () => {
+    console.log('SIGTERM received, shutting down gracefully');
+    
+    // Stop the monitor gracefully
+    if (server.monitor) {
+        server.monitor.stop();
+    }
+    
     server.server.close(() => {
         process.exit(0);
     });

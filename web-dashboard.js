@@ -278,14 +278,14 @@ class EnhancedDashboard {
     }
 
     calculateEstimatedHashrate(miners, sharesLastHour) {
-        // Rough estimation based on connected miners and share rate
-        const connectedMiners = miners.filter(m => m.is_connected).length;
-        if (connectedMiners === 0) return 0;
-
-        // Assume each S9 is ~14 TH/s
-        // This is a simplification - real calculation would use difficulty and share timestamps
-        const estimatedPerMiner = 14; // TH/s
-        return (connectedMiners * estimatedPerMiner).toFixed(1);
+        // Count connected miners with recent activity
+        const activeMiners = miners.filter(m => m.is_connected && m.total_shares > 0).length;
+        
+        if (activeMiners > 0) {
+            return (activeMiners * 14).toFixed(1); // 14 TH/s per S9
+        }
+        
+        return "0.0";
     }
 
     calculateUptimePercent(miners) {
