@@ -301,18 +301,31 @@ class EnhancedDashboard {
     }
 
     calculateEstimatedHashrate(miners, sharesLastHour) {
-        console.log('=== SIMPLE MINER COUNT METHOD ===');
+        console.log('=== HASHRATE CALCULATION DEBUG ===');
+        console.log('Miners array length:', miners ? miners.length : 'undefined');
+        console.log('Miners data:', JSON.stringify(miners, null, 2));
         
-        // Count connected miners from the query
-        const connectedMiners = miners.filter(m => m.is_connected).length;
-        console.log('Connected miners:', connectedMiners);
+        if (!miners || !Array.isArray(miners)) {
+            console.log('No miners array provided');
+            return "0.0";
+        }
+        
+        // Count connected miners from the database query
+        const connectedMiners = miners.filter(m => {
+            const isConnected = m.is_connected === true;
+            console.log(`Miner ${m.username}: is_connected = ${m.is_connected} (${typeof m.is_connected}), counted = ${isConnected}`);
+            return isConnected;
+        }).length;
+        
+        console.log('Connected miners count:', connectedMiners);
         
         if (connectedMiners > 0) {
             const hashrate = (connectedMiners * 14).toFixed(1);
-            console.log('Hashrate calculation: ', connectedMiners, '× 14 TH/s =', hashrate, 'TH/s');
+            console.log('Final hashrate calculation:', connectedMiners, '× 14 TH/s =', hashrate, 'TH/s');
             return hashrate;
         }
         
+        console.log('No connected miners found, returning 0.0');
         return "0.0";
     }
 
