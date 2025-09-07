@@ -313,33 +313,42 @@ class RealStratumServer extends EventEmitter {
         console.log(`Miner authorized: ${username} from ${miner.address} - Using difficulty ${miner.difficulty} (set in subscribe)`);
     }
 
-    handleAuthorize(miner, id, params) {
-        const [username, password] = params;
+    handleSubscribe(miner, id, params) {
+        console.log("🔧 ENTERING handleSubscribe function");
         
-        miner.authorized = true;
-        miner.username = username;
+        const subscriptionId = crypto.randomBytes(4).toString('hex');
+        const extranonce1 = crypto.randomBytes(4).toString('hex');
         
-        // ✅ NEW DYNAMIC DIFFICULTY APPROACH
-        miner.difficulty = 1;  // Start very low, adjust dynamically
-        miner.shareCount = 0;
-        miner.validShares = 0;
-        miner.lastDifficultyAdjust = Date.now();
+        miner.subscribed = true;
+        miner.subscriptionId = subscriptionId;
+        miner.extranonce1 = extranonce1;
         
-        // Log to database
-        this.db.logMinerConnection(miner.id, username, miner.address);
+        // **CRITICAL FIX: Set much lower difficulty for pool shares**
+        miner.difficulty = 0.000244; // This should give ~95% acceptance rate
+        
+        console.log(`🔧 SUBSCRIBE DEBUG: Difficulty set to ${miner.difficulty}`);
         
         const response = {
             id: id,
-            result: true,
+            result: [
+                [
+                    ["mining.set_difficulty", subscriptionId],
+                    ["mining.notify", subscriptionId]
+                ],
+                extranonce1,
+                4
+            ],
             error: null
         };
 
         this.sendMessage(miner.socket, response);
-        
-        // Send initial difficulty immediately
         this.sendDifficulty(miner);
         
-        console.log(`Miner authorized: ${username} from ${miner.address} - Starting with difficulty ${miner.difficulty} (will adjust dynamically)`);
+        if (this.currentJob) {
+            this.sendJob(miner);
+        }
+
+        console.log(`Miner subscribed: ${miner.address} (${miner.id.substring(0, 8)}) with difficulty ${miner.difficulty}`);
     }
 
     async handleSubmit(miner, id, params) {
