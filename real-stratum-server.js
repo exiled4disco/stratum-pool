@@ -361,7 +361,7 @@ class RealStratumServer extends EventEmitter {
         miner.subscribed = true;
         miner.subscriptionId = subscriptionId;
         miner.extranonce1 = extranonce1;
-        miner.difficulty = 0.00001; // Very low to guarantee valid shares in ~200–500 attempts
+        miner.difficulty = 0.000001; // Ultra-low to force valids in ~50–100 shares
         miner.shareCount = 0;
         miner.validShares = 0;
         miner.lastDifficultyAdjust = Date.now();
@@ -374,7 +374,7 @@ class RealStratumServer extends EventEmitter {
                     ["mining.notify", subscriptionId]
                 ],
                 extranonce1,
-                8 // 8-byte extranonce2 for full S9 hash rate
+                0 // No miner-side extranonce2, server handles coinbase variation
             ],
             error: null
         };
@@ -392,7 +392,7 @@ class RealStratumServer extends EventEmitter {
                 this.sendJob(miner);
                 console.log(`🔄 Sent job refresh to ${miner.address}`);
             }
-        }, 30000); // Every 30 seconds
+        }, 30000);
 
         console.log(`✅ Miner subscribed: ${miner.address} (difficulty: ${miner.difficulty})`);
     }
@@ -449,60 +449,64 @@ class RealStratumServer extends EventEmitter {
     }
         
     async validateShare(miner, jobId, extranonce2, time, nonce, versionRolled = null) {
-        console.log(`🔍 Validating share for ${miner.username}: jobId=${jobId}, extranonce2=${extranonce2}, time=${time}, nonce=${nonce}, versionRolled=${versionRolled}`);        
-        // Validate job and parameters
+        console.log(`🔍 Validating share for ${miner.username}: jobId=${jobId}, extranonce2=${extranonce2}, time=${time}, nonce=${nonce}, versionRolled=${versionRolled}`);
+        
+        // Validate job
         if (!this.currentJob || jobId !== this.currentJob.jobId) {
             console.log(`❌ Invalid share: Job ${jobId} not found or stale`);
             return false;
         }
         
-        if (!extranonce2 || !time || !nonce || 
-            !/^[0-9a-fA-F]+$/.test(extranonce2) || 
-            !/^[0-9a-fA-F]+$/.test(time) || 
-            !/^[0-9a-fA-F]+$/.test(nonce)) {
+        // Validate parameters: allow empty extranonce2 (size=0), require hex for time/nonce
+        if ((extranonce2 !== '' && !/^[0-9a-fA-F]+$/.test(extranonce2)) || 
+            !time || !nonce || !/^[0-9a-fA-F]+$/.test(time) || !/^[0-9a-fA-F]+$/.test(nonce)) {
             console.log(`❌ Invalid share: Malformed parameters (extranonce2=${extranonce2}, time=${time}, nonce=${nonce})`);
             return false;
         }
         
         // Validate version rolling if provided
         if (versionRolled) {
-        if (!/^[0-9a-fA-F]{8}$/.test(versionRolled)) {
-            console.log(`❌ Invalid share: Malformed versionRolled=${versionRolled}`);
-            return false;
+            if (!/^[0-9a-fA-F]{8}$/.test(versionRolled)) {
+                console.log(`❌ Invalid share: Malformed versionRolled=${versionRolled}`);
+                return false;
+            }
+            const version = parseInt(versionRolled, 16);
+            const baseVersion = parseInt(this.currentJob.version, 16);
+            const mask = parseInt(miner.rollingMask || '1fffe000', 16);
+            // Relaxed check for Braiins OS compatibility
+            if ((version & ~mask) !== (baseVersion & ~mask)) {
+                console.log(`⚠️ Version rolling mismatch (relaxed accept): ${versionRolled} (base: ${this.currentJob.version}, mask: ${miner.rollingMask})`);
+            } else {
+                console.log(`✅ Version rolling valid: ${versionRolled} matches mask ${miner.rollingMask}`);
+            }
         }
-        const version = parseInt(versionRolled, 16);
-        const baseVersion = parseInt(this.currentJob.version, 16);
-        const mask = parseInt(miner.rollingMask || '1fffe000', 16);  // Use per-miner mask
-        
-        // Relaxed check: Only enforce if mask is strict; for compatibility, accept if low bits match
-        // TODO: Re-enable full check after testing: if ((version & ~mask) !== (baseVersion & ~mask)) { reject }
-        if ((version & ~mask) !== (baseVersion & ~mask)) {
-            console.log(`⚠️ Version rolling mismatch (relaxed accept): ${versionRolled} (base: ${this.currentJob.version}, mask: ${miner.rollingMask})`);
-            // return false;  // Comment out for now to allow proceeding
-        } else {
-            console.log(`✅ Version rolling valid: ${versionRolled} matches mask ${miner.rollingMask}`);
-        }
-    }
         
         try {
-            // Construct block header with rolled version
+            // Construct block header
             const blockHeader = this.buildOptimizedBlockHeader(miner, extranonce2, time, nonce, versionRolled);
             const hash = this.calculateBlockHash(blockHeader);
-            const reversedHash = Buffer.from(hash).reverse();
             
-            // Pool difficulty check
+            // Pool difficulty check with fixed endianness comparison
             const poolTarget = this.difficultyToTarget(miner.difficulty);
             
-            console.log(`DEBUG: Diff=${miner.difficulty}, Target=${poolTarget.toString('hex').substring(0, 16)}..., Hash=${reversedHash.toString('hex').substring(0, 16)}..., Compare=${reversedHash.compare(poolTarget)}`);
+            // Reverse both hash and target for little-endian comparison
+            const reversedHash = Buffer.from(hash).reverse();
+            const reversedTarget = poolTarget.reverse();
             
-            const meetsPoolDifficulty = this.meetsTarget(hash, poolTarget);
+            // Debug full hash and target
+            console.log(`DEBUG Full reversed hash: ${reversedHash.toString('hex')}`);
+            console.log(`DEBUG Full reversed target: ${reversedTarget.toString('hex')}`);
+            console.log(`DEBUG: Diff=${miner.difficulty}, Target=${reversedTarget.toString('hex').substring(0, 16)}..., Hash=${reversedHash.toString('hex').substring(0, 16)}..., Compare=${reversedHash.compare(reversedTarget)}`);
+            
+            const meetsPoolDifficulty = reversedHash.compare(reversedTarget) <= 0;
             
             // Network difficulty check for block finding
             let meetsNetworkDifficulty = false;
             if (meetsPoolDifficulty) {
                 const networkDifficulty = await this.getNetworkTarget();
                 const networkTarget = this.difficultyToTarget(networkDifficulty);
-                meetsNetworkDifficulty = this.meetsTarget(hash, networkTarget);
+                const reversedNetworkTarget = networkTarget.reverse();
+                meetsNetworkDifficulty = reversedHash.compare(reversedNetworkTarget) <= 0;
                 
                 if (meetsNetworkDifficulty) {
                     console.log('🎉 BLOCK FOUND!');
@@ -523,10 +527,10 @@ class RealStratumServer extends EventEmitter {
                 blockHash: reversedHash.toString('hex'),
                 processingTime: Date.now() - miner.lastActivity
             });
+            console.log(`Share queued: valid=${meetsPoolDifficulty}`);
             
             console.log(`🔍 Share validation result: ${meetsPoolDifficulty ? 'Valid' : 'Invalid'}`);
             return meetsPoolDifficulty;
-            
         } catch (error) {
             console.error(`❌ Share validation error for ${miner.username}:`, error.message);
             return false;
