@@ -281,14 +281,22 @@ class EnhancedDashboard {
         console.log('=== HASHRATE CALCULATION DEBUG ===');
         console.log('Total miners received:', miners.length);
         
-        // Just count connected miners - simple and reliable
-        const connectedMiners = miners.filter(m => {
-            console.log(`Miner ${m.username}: connected=${m.is_connected}, shares=${m.total_shares}`);
-            return m.is_connected === true;
+        // Count miners that are either:
+        // 1. Currently connected, OR
+        // 2. Have been active in the last hour (submitted shares recently)
+        const activeMiners = miners.filter(m => {
+            const isCurrentlyConnected = m.is_connected === true;
+            const hasRecentShares = m.shares_last_hour > 0;
+            const hasHistoricalShares = m.total_shares > 0;
+            
+            console.log(`Miner ${m.username}: connected=${isCurrentlyConnected}, recent_shares=${m.shares_last_hour}, total_shares=${m.total_shares}`);
+            
+            // Active if currently connected OR has recent share activity
+            return isCurrentlyConnected || hasRecentShares || hasHistoricalShares;
         }).length;
         
-        console.log('Connected miners count:', connectedMiners);
-        const hashrate = (connectedMiners * 14).toFixed(1);
+        console.log('Active miners count:', activeMiners);
+        const hashrate = (activeMiners * 14).toFixed(1);
         console.log('Calculated hashrate:', hashrate, 'TH/s');
         console.log('=== END HASHRATE DEBUG ===');
         
