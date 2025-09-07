@@ -20,10 +20,13 @@ class RealStratumServer extends EventEmitter {
         this.jobCounter = 0;
         this.currentJob = null;
         
-        // Add these lines for caching and batching:
+        // Caching and batching
         this.cachedNetworkDifficulty = null;
         this.lastDifficultyUpdate = 0;
         this.shareQueue = [];
+        
+        // Bitcoin's maximum target (difficulty 1)
+        this.MAX_TARGET = BigInt('0x00000000FFFF0000000000000000000000000000000000000000000000000000');
        
         // Initialize Bitcoin connector
         this.bitcoin = new BitcoinConnector({
@@ -41,14 +44,13 @@ class RealStratumServer extends EventEmitter {
 
         // Initialize the monitoring system
         this.monitor = new MiningPoolMonitor({
-            checkInterval: 30000,      // Check every 30 seconds
-            alertCooldown: 300000,     // 5 minute cooldown between duplicate alerts
+            checkInterval: 300000,
+            alertCooldown: 1800000,
             logFile: './logs/mining-monitor.log'
         });
     }
 
     async start() {
-        // Test Bitcoin connection first
         const connected = await this.bitcoin.testConnection();
         if (!connected) {
             console.error('Failed to connect to Bitcoin node!');
@@ -61,10 +63,7 @@ class RealStratumServer extends EventEmitter {
             console.log(`Connected to Bitcoin node successfully`);
         });
 
-        // Start the monitoring system
         await this.monitor.start();
-
-        // Get initial work
         await this.updateWork();
         return true;
     }
@@ -79,7 +78,6 @@ class RealStratumServer extends EventEmitter {
     async getNetworkTarget() {
         const now = Date.now();
         
-        // Cache difficulty for 60 seconds to reduce RPC load
         if (this.cachedNetworkDifficulty && (now - this.lastDifficultyUpdate) < 300000) {
             return this.cachedNetworkDifficulty;
         }
@@ -91,7 +89,7 @@ class RealStratumServer extends EventEmitter {
             return this.cachedNetworkDifficulty;
         } catch (error) {
             console.error('Error getting network difficulty:', error);
-            return this.cachedNetworkDifficulty || 73197670707408.73; // Use cached or fallback
+            return this.cachedNetworkDifficulty || 73197670707408.73;
         }
     }
 
@@ -99,7 +97,6 @@ class RealStratumServer extends EventEmitter {
         try {
             const job = await this.bitcoin.getBlockTemplate();
             if (job && (!this.currentJob || job.height !== this.currentJob.height)) {
-                // Clear cached templates when new block arrives
                 if (this.currentJob) {
                     delete this.currentJob.cachedCoinbaseTemplate;
                 }
@@ -120,33 +117,62 @@ class RealStratumServer extends EventEmitter {
         });
     }
 
-    // Add this method to your RealStratumServer class:
+    /**
+     * Convert difficulty to target value
+     */
+    difficultyToTarget(difficulty) {
+        if (difficulty <= 0) {
+            difficulty = 0.00001;
+        }
+        
+        // Bitcoin's maximum target (difficulty 1)
+        const maxTargetHex = '00000000FFFF0000000000000000000000000000000000000000000000000000';
+        const maxTarget = BigInt('0x' + maxTargetHex);
+        
+        if (difficulty < 1.0) {
+            // For difficulties less than 1, just use the maximum target
+            return Buffer.from(maxTargetHex, 'hex');
+        } else {
+            // For difficulties >= 1, calculate normally
+            const targetBig = maxTarget / BigInt(Math.floor(difficulty));
+            const targetHex = targetBig.toString(16).padStart(64, '0');
+            return Buffer.from(targetHex, 'hex');
+        }
+    }
+
+    /**
+     * Check if hash meets target difficulty
+     */
+    meetsTarget(hash, target) {
+        const reversedHash = Buffer.from(hash).reverse();
+        return reversedHash.compare(target) <= 0;
+    }
+
     adjustMinerDifficulty(miner) {
         const now = Date.now();
         const timeSinceLastAdjust = now - (miner.lastDifficultyAdjust || now);
         
-        // Only adjust every 30 seconds minimum
-        if (timeSinceLastAdjust < 30000) return;
+        // Only adjust every 60 seconds minimum
+        if (timeSinceLastAdjust < 60000) return;
         
-        const targetSharesPerMinute = 4; // Aim for 4 shares per minute
-        const timeWindowMs = Math.min(timeSinceLastAdjust, 60000); // Max 1 minute window
-        const actualSharesPerMinute = (miner.validShares || 0) / (timeWindowMs / 60000);
+        const targetSharesPerMinute = 4;
+        const timeWindowMinutes = Math.min(timeSinceLastAdjust / 60000, 10);
+        const actualSharesPerMinute = (miner.validShares || 0) / timeWindowMinutes;
         
         let newDifficulty = miner.difficulty;
         
+        // Adjust difficulty based on share rate
         if (actualSharesPerMinute > targetSharesPerMinute * 1.5) {
-            // Too many shares - increase difficulty
-            newDifficulty = Math.min(miner.difficulty * 1.5, 65536); // Max difficulty
-        } else if (actualSharesPerMinute < targetSharesPerMinute * 0.5) {
-            // Too few shares - decrease difficulty
-            newDifficulty = Math.max(miner.difficulty * 0.7, 1); // Min difficulty
+            newDifficulty = Math.min(miner.difficulty * 2, 1);
+        } else if (actualSharesPerMinute < targetSharesPerMinute * 0.5 && miner.validShares > 5) {
+            newDifficulty = Math.max(miner.difficulty * 0.5, 0.00001);
         }
         
-        if (newDifficulty !== miner.difficulty) {
-            console.log(`🎯 Adjusting ${miner.username} difficulty: ${miner.difficulty} → ${newDifficulty} (${actualSharesPerMinute.toFixed(1)} shares/min)`);
+        if (Math.abs(newDifficulty - miner.difficulty) / miner.difficulty > 0.1) {
+            console.log(`🎯 Adjusting ${miner.username} difficulty: ${miner.difficulty.toFixed(6)} → ${newDifficulty.toFixed(6)}`);
             miner.difficulty = newDifficulty;
             miner.lastDifficultyAdjust = now;
-            miner.validShares = 0; // Reset counter
+            miner.validShares = 0;
             this.sendDifficulty(miner);
         }
     }
@@ -159,7 +185,7 @@ class RealStratumServer extends EventEmitter {
             socket: socket,
             subscribed: false,
             authorized: false,
-            difficulty: 1,
+            difficulty: 0.0001,
             lastActivity: Date.now(),
             address: socket.remoteAddress,
             shares: 0,
@@ -168,56 +194,58 @@ class RealStratumServer extends EventEmitter {
         };
 
         this.miners.set(minerId, miner);
-        console.log(`New connection: ${miner.address} (${minerId.substring(0, 8)})`);
+        console.log(`🔗 NEW CONNECTION: ${miner.address} (${minerId.substring(0, 8)})`);
 
-        // Record miner connection for monitoring
         this.monitor.recordMinerConnection(minerId, 'new-connection', socket.remoteAddress);
-
-        // Set socket timeout to prevent hanging connections
-        socket.setTimeout(300000); // 2 minutes
+        
+        // Increase timeout for debugging
+        socket.setTimeout(600000); // 10 minutes
 
         const keepAlive = setInterval(() => {
             if (socket.writable && !socket.destroyed) {
-                socket.write('\n');
+                // Don't send keepalive during debugging - it might interfere
+                // socket.write('\n');
             } else {
                 clearInterval(keepAlive);
             }
         }, 30000);        
 
         socket.on('data', (data) => {
+            console.log(`📡 DATA EVENT for ${miner.address}`);
             this.handleData(minerId, data);
         });
 
         socket.on('close', () => {
             const duration = Date.now() - startTime;
             const avgTimePerShare = miner.shares > 0 ? duration / miner.shares : 0;
-            console.log(`Connection lasted ${duration}ms, ${miner.shares} shares, ${avgTimePerShare.toFixed(0)}ms/share average`);
             
-            // Log disconnection to database
+            console.log(`🔌 CONNECTION CLOSED: ${miner.address} (${minerId.substring(0, 8)})`);
+            console.log(`   Duration: ${duration}ms`);
+            console.log(`   Subscribed: ${miner.subscribed}`);
+            console.log(`   Authorized: ${miner.authorized}`);
+            console.log(`   Shares: ${miner.shares}`);
+            
             this.db.logMinerDisconnection(miner.id);
-            
-            // Record miner disconnection for monitoring
             this.monitor.recordMinerDisconnection(miner.id, miner.username || 'unknown');
             
-            // Cleanup
             clearInterval(keepAlive);
             this.miners.delete(minerId);
             socket.removeAllListeners();
-            
-            //console.log(`Miner disconnected: ${miner.address} (${minerId.substring(0, 8)}) - ${miner.validShares}/${miner.shares} valid shares`);
         });
 
         socket.on('timeout', () => {
-            console.log(`Socket timeout for ${miner.address}`);
+            console.log(`⏰ SOCKET TIMEOUT for ${miner.address}`);
             socket.destroy();
         });
 
         socket.on('error', (err) => {
+            console.log(`💥 SOCKET ERROR for ${miner.address}: ${err.message}`);
             clearInterval(keepAlive);
-            console.error(`Socket error for ${miner.address}:`, err.message);
             this.miners.delete(minerId);
             socket.destroy();
         });
+        
+        console.log(`🎯 Waiting for messages from ${miner.address}...`);
     }
 
     handleData(minerId, data) {
@@ -225,7 +253,10 @@ class RealStratumServer extends EventEmitter {
         if (!miner) return;
 
         miner.lastActivity = Date.now();
-
+        
+        // DEBUG: Log all incoming data
+        console.log(`📥 RAW DATA from ${miner.address}:`, data.toString().trim());
+        
         const messages = data.toString().trim().split('\n');
         
         for (const messageStr of messages) {
@@ -233,10 +264,11 @@ class RealStratumServer extends EventEmitter {
             
             try {
                 const message = JSON.parse(messageStr);
-                console.log(`Received from ${miner.address}:`, JSON.stringify(message));
+                console.log(`📨 PARSED MESSAGE from ${miner.address}:`, JSON.stringify(message));
                 this.processMessage(minerId, message);
             } catch (err) {
-                // Silently ignore malformed JSON - S9 sends some non-JSON data
+                console.log(`⚠️ JSON PARSE ERROR from ${miner.address}:`, err.message);
+                console.log(`⚠️ FAILED MESSAGE:`, messageStr);
                 continue;
             }
         }
@@ -247,21 +279,26 @@ class RealStratumServer extends EventEmitter {
         if (!miner) return;
 
         const { method, params, id } = message;
+        console.log(`🔄 PROCESSING ${method} from ${miner.address}`);
 
         switch (method) {
             case 'mining.subscribe':
+                console.log(`📝 Processing subscribe from ${miner.address}`);
                 this.handleSubscribe(miner, id, params);
                 break;
             
             case 'mining.authorize':
+                console.log(`🔐 Processing authorize from ${miner.address}`);
                 this.handleAuthorize(miner, id, params);
                 break;
             
             case 'mining.submit':
+                console.log(`⛏️ Processing share submit from ${miner.address}`);
                 this.handleSubmit(miner, id, params);
                 break;
             
             case 'mining.configure':
+                console.log(`⚙️ Processing configure from ${miner.address}`);
                 const configResponse = {
                     id: id,
                     result: {
@@ -273,44 +310,13 @@ class RealStratumServer extends EventEmitter {
                     error: null
                 };
                 this.sendMessage(miner.socket, configResponse);
-                console.log(`Configure request handled for ${miner.address}`);
+                console.log(`✅ Sent configure response to ${miner.address}`);
                 break;
 
             default:
-                console.log(`Unknown method: ${method}`);
+                console.log(`❓ Unknown method: ${method} from ${miner.address}`);
                 this.sendError(miner.socket, id, -3, 'Method not found');
         }
-    }
-
-    handleAuthorize(miner, id, params) {
-        const [username, password] = params;
-        
-        miner.authorized = true;
-        miner.username = username;
-        
-        // ❌ REMOVE THIS LINE - it's overriding the low difficulty from handleSubscribe
-        // miner.difficulty = 1;  // Start very low, adjust dynamically
-        
-        // Keep the tracking variables
-        miner.shareCount = 0;
-        miner.validShares = 0;
-        miner.lastDifficultyAdjust = Date.now();
-        
-        // Log to database
-        this.db.logMinerConnection(miner.id, username, miner.address);
-        
-        const response = {
-            id: id,
-            result: true,
-            error: null
-        };
-
-        this.sendMessage(miner.socket, response);
-        
-        // Send current difficulty (don't change it here)
-        this.sendDifficulty(miner);
-        
-        console.log(`Miner authorized: ${username} from ${miner.address} - Using difficulty ${miner.difficulty} (set in subscribe)`);
     }
 
     handleSubscribe(miner, id, params) {
@@ -320,11 +326,10 @@ class RealStratumServer extends EventEmitter {
         miner.subscribed = true;
         miner.subscriptionId = subscriptionId;
         miner.extranonce1 = extranonce1;
-        
-        // TESTING: Set extremely low difficulty
-        miner.difficulty = 0.00001; // Should give high acceptance rate
-        
-        console.log(`🔧 SUBSCRIBE: Setting test difficulty to ${miner.difficulty}`);
+        miner.difficulty = 0.0001; // Start low for S9
+        miner.shareCount = 0;
+        miner.validShares = 0;
+        miner.lastDifficultyAdjust = Date.now();
         
         const response = {
             id: id,
@@ -340,16 +345,33 @@ class RealStratumServer extends EventEmitter {
         };
 
         this.sendMessage(miner.socket, response);
-        
-        // Send difficulty immediately
         this.sendDifficulty(miner);
         
-        // Send job if available
         if (this.currentJob) {
             this.sendJob(miner);
         }
 
-        console.log(`✅ Miner subscribed: ${miner.address} with difficulty ${miner.difficulty}`);
+        console.log(`✅ Miner subscribed: ${miner.address} (difficulty: ${miner.difficulty})`);
+    }
+
+    handleAuthorize(miner, id, params) {
+        const [username, password] = params;
+        
+        miner.authorized = true;
+        miner.username = username;
+        
+        this.db.logMinerConnection(miner.id, username, miner.address);
+        
+        const response = {
+            id: id,
+            result: true,
+            error: null
+        };
+
+        this.sendMessage(miner.socket, response);
+        this.sendDifficulty(miner);
+        
+        console.log(`Miner authorized: ${username} from ${miner.address} - Using difficulty ${miner.difficulty}`);
     }
 
     async handleSubmit(miner, id, params) {
@@ -361,14 +383,10 @@ class RealStratumServer extends EventEmitter {
         const [username, jobId, extranonce2, time, nonce] = params;
         miner.shares++;
         
-        console.log(`Share submitted by ${username}: job=${jobId}, nonce=${nonce}`);
-        
-        // Validate the share
         const isValid = await this.validateShare(miner, jobId, extranonce2, time, nonce);
         
         if (isValid) {
             miner.validShares++;
-            // ✅ ADD DYNAMIC DIFFICULTY ADJUSTMENT HERE
             this.adjustMinerDifficulty(miner);
         }
         
@@ -383,63 +401,50 @@ class RealStratumServer extends EventEmitter {
         if (isValid) {
             console.log(`✅ Valid share from ${username} (${miner.validShares}/${miner.shares})`);
             this.emit('validShare', { miner, jobId, nonce });
-        } else {
-            console.log(`❌ Invalid share from ${username} (${miner.validShares}/${miner.shares})`);
         }
     }
         
     async validateShare(miner, jobId, extranonce2, time, nonce) {
-        const startTime = Date.now();
-
         // Basic validation
         if (!this.currentJob || jobId !== this.currentJob.jobId) {
-            console.log(`❌ Job validation failed: ${jobId} vs ${this.currentJob?.jobId}`);
+            return false;
+        }
+        
+        if (!extranonce2 || !time || !nonce || 
+            !/^[0-9a-fA-F]+$/.test(extranonce2) || 
+            !/^[0-9a-fA-F]+$/.test(nonce)) {
             return false;
         }
         
         try {
-            // Build block header
             const blockHeader = this.buildOptimizedBlockHeader(miner, extranonce2, time, nonce);
-            
-            // Calculate hash
             const hash = this.calculateBlockHash(blockHeader);
             const reversedHash = Buffer.from(hash).reverse();
             
-            // CRITICAL: Use MINER'S pool difficulty, NOT network difficulty
-            console.log(`🎯 Using MINER difficulty: ${miner.difficulty} (NOT network difficulty)`);
+            // Pool difficulty check
+            const poolTarget = this.difficultyToTarget(miner.difficulty);
             
-            // Check pool difficulty ONLY using miner's assigned difficulty
-            const poolTarget = this.difficultyToTargetFixed(miner.difficulty);
+            // ADD THIS DEBUG LINE:
+            console.log(`DEBUG: Diff=${miner.difficulty}, Target=${poolTarget.toString('hex').substring(0,16)}..., Hash=${reversedHash.toString('hex').substring(0,16)}..., Compare=${reversedHash.compare(poolTarget)}`);
+            
             const meetsPoolDifficulty = reversedHash.compare(poolTarget) <= 0;
             
-            // Simplified logging - remove the excessive debug output
-            if (meetsPoolDifficulty) {
-                console.log(`✅ Valid pool share from ${miner.username} - Hash: ${reversedHash.toString('hex').substring(0, 16)}...`);
-            } else {
-                // Only log every 50th rejection to reduce spam
-                if (miner.shares % 50 === 0) {
-                    console.log(`❌ Share ${miner.shares} rejected from ${miner.username} - Target too high`);
-                }
-            }
-            
-            // SEPARATE check for network difficulty (only for block finding)
+            // Network difficulty check for block finding
             let meetsNetworkDifficulty = false;
             if (meetsPoolDifficulty) {
                 const networkDifficulty = await this.getNetworkTarget();
-                const networkTarget = this.difficultyToTargetFixed(networkDifficulty);
+                const networkTarget = this.difficultyToTarget(networkDifficulty);
                 meetsNetworkDifficulty = reversedHash.compare(networkTarget) <= 0;
                 
                 if (meetsNetworkDifficulty) {
-                    console.log('🎉 BLOCK FOUND! Hash meets network difficulty!');
-                    await this.db.logBlockFound(miner.id, reversedHash.toString('hex'), this.currentJob.height);
+                    console.log('BLOCK FOUND!');
+                    const blockHash = reversedHash.toString('hex');
+                    await this.db.logBlockFound(miner.id, blockHash, this.currentJob.height);
                     await this.submitFoundBlock(blockHeader, miner, extranonce2);
                 }
             }
             
-            // Processing time
-            const processingTime = Date.now() - startTime;
-            
-            // Queue for database logging (remove the spam)
+            // Queue for database logging
             this.shareQueue.push({
                 minerId: miner.id,
                 jobId,
@@ -448,16 +453,17 @@ class RealStratumServer extends EventEmitter {
                 meetsPoolDiff: meetsPoolDifficulty,
                 meetsNetworkDiff: meetsNetworkDifficulty,
                 blockHash: reversedHash.toString('hex'),
-                processingTime
+                processingTime: 1
             });
             
             return meetsPoolDifficulty;
             
         } catch (error) {
-            console.error('Validation error:', error);
+            console.error('Share validation error:', error.message);
             return false;
         }
     }
+
     encodeVarint(num) {
         if (num < 0xFD) {
             return Buffer.from([num]).toString('hex');
@@ -474,20 +480,16 @@ class RealStratumServer extends EventEmitter {
         try {
             const job = this.currentJob;
             
-            // Validate required components
             if (!job.coinb1 || !job.coinb2 || !miner.extranonce1 || !extranonce2) {
                 throw new Error('Missing coinbase components');
             }
             
-            // Construct coinbase transaction: coinb1 + extranonce1 + extranonce2 + coinb2
             let coinbaseTx = job.coinb1 + miner.extranonce1 + extranonce2 + job.coinb2;
             
-            // Add witness commitment for SegWit blocks if available
             if (job.default_witness_commitment) {
                 coinbaseTx += job.default_witness_commitment;
             }
             
-            // Validate hex format
             if (!/^[0-9a-fA-F]+$/.test(coinbaseTx)) {
                 throw new Error('Invalid hex format in coinbase transaction');
             }
@@ -501,44 +503,33 @@ class RealStratumServer extends EventEmitter {
 
     buildFullBlock(header, miner, extranonce2) {
         try {
-            // Normalize header input
             const headerBuffer = Buffer.isBuffer(header) ? header : Buffer.from(header, 'hex');
             
             if (headerBuffer.length !== 80) {
                 throw new Error(`Invalid block header length: ${headerBuffer.length}, expected 80 bytes`);
             }
             
-            // Get and validate transactions from block template
             const transactions = this.currentJob.transactions || [];
-            const txCount = transactions.length + 1; // +1 for coinbase
+            const txCount = transactions.length + 1;
             
-            console.log(`Building block with ${txCount} transactions (${transactions.length} + coinbase)`);
-            
-            // Build block parts using Buffer array for efficiency
             const blockParts = [];
             
-            // 1. Block header (80 bytes)
+            // Block header
             blockParts.push(headerBuffer);
             
-            // 2. Transaction count (varint)
+            // Transaction count
             const txCountBuffer = Buffer.from(this.encodeVarint(txCount), 'hex');
             blockParts.push(txCountBuffer);
             
-            // 3. Coinbase transaction
+            // Coinbase transaction
             const coinbaseTx = this.reconstructCoinbase(miner, extranonce2);
             if (!coinbaseTx) {
                 throw new Error('Failed to reconstruct coinbase transaction');
             }
             
-            // Validate coinbase transaction hex
-            if (!/^[0-9a-fA-F]+$/.test(coinbaseTx)) {
-                throw new Error('Invalid coinbase transaction hex format');
-            }
-            
             blockParts.push(Buffer.from(coinbaseTx, 'hex'));
-            console.log(`Added coinbase transaction: ${coinbaseTx.length / 2} bytes`);
             
-            // 4. Add other transactions from block template
+            // Other transactions
             for (let i = 0; i < transactions.length; i++) {
                 const tx = transactions[i];
                 
@@ -546,42 +537,19 @@ class RealStratumServer extends EventEmitter {
                     throw new Error(`Transaction ${i} missing data field`);
                 }
                 
-                if (!/^[0-9a-fA-F]+$/.test(tx.data)) {
-                    throw new Error(`Transaction ${i} has invalid hex format`);
-                }
-                
                 blockParts.push(Buffer.from(tx.data, 'hex'));
             }
             
-            // 5. Concatenate all parts
             const blockBuffer = Buffer.concat(blockParts);
             
-            // 6. Validate block size constraints
-            if (blockBuffer.length > 4000000) { // 4MB weight limit
+            if (blockBuffer.length > 4000000) {
                 throw new Error(`Block size ${blockBuffer.length} exceeds 4MB limit`);
             }
             
-            if (blockBuffer.length > 1000000) { // 1MB legacy serialized size
-                console.warn(`Block size ${blockBuffer.length} exceeds 1MB legacy limit`);
-            }
-            
-            const blockHex = blockBuffer.toString('hex');
-            
-            console.log(`Block constructed successfully:`);
-            console.log(`- Header: 80 bytes`);
-            console.log(`- Transactions: ${txCount}`);
-            console.log(`- Total size: ${blockBuffer.length} bytes`);
-            console.log(`- Block hash: ${this.calculateBlockHash(headerBuffer).reverse().toString('hex')}`);
-            
-            return blockHex;
+            return blockBuffer.toString('hex');
             
         } catch (error) {
-            console.error('Block construction failed:', {
-                message: error.message,
-                header: header ? (Buffer.isBuffer(header) ? header.toString('hex').slice(0, 32) + '...' : header.slice(0, 32) + '...') : 'undefined',
-                txCount: this.currentJob ? (this.currentJob.transactions || []).length + 1 : 'unknown',
-                jobId: this.currentJob ? this.currentJob.jobId : 'no current job'
-            });
+            console.error('Block construction failed:', error.message);
             return null;
         }
     }
@@ -590,7 +558,6 @@ class RealStratumServer extends EventEmitter {
         try {
             console.log('Constructing complete block for submission...');
             
-            // Build the complete block
             const blockHex = this.buildFullBlock(blockHeader, miner, extranonce2);
             
             if (!blockHex) {
@@ -601,31 +568,23 @@ class RealStratumServer extends EventEmitter {
             console.log('Submitting block to Bitcoin network...');
             console.log(`Block size: ${blockHex.length / 2} bytes`);
             
-            // Submit block to Bitcoin Core
             const result = await this.bitcoin.callRpc('submitblock', [blockHex]);
             
             if (result === null) {
-                // Successful submission
                 console.log('🎉 BLOCK ACCEPTED BY BITCOIN NETWORK! 🎉');
                 console.log('Block reward (3.125 BTC + fees) will arrive at:', this.bitcoin.poolAddress);
-                console.log('Block hex:', blockHex.slice(0, 160) + '...');
                 
-                // Record block submission for monitoring
                 const blockHash = this.calculateBlockHash(blockHeader).reverse().toString('hex');
                 this.monitor.recordBlockSubmission(blockHash, this.currentJob.height, miner.id);
                 
-                // Log to file for permanent record
                 const timestamp = new Date().toISOString();
                 const logEntry = `${timestamp}: BLOCK FOUND - Hash: ${blockHash}, Size: ${blockHex.length / 2} bytes\n`;
                 
                 require('fs').appendFileSync('./logs/blocks-found.log', logEntry);
                 
             } else {
-                // Block was rejected
                 console.error('Block rejected by network:', result);
-                console.error('Rejection reason code:', result);
                 
-                // Log rejection for analysis
                 const timestamp = new Date().toISOString();
                 const logEntry = `${timestamp}: BLOCK REJECTED - Reason: ${result}, Size: ${blockHex.length / 2} bytes\n`;
                 require('fs').appendFileSync('./logs/blocks-rejected.log', logEntry);
@@ -635,68 +594,13 @@ class RealStratumServer extends EventEmitter {
             
         } catch (error) {
             console.error('Block submission failed:', error.message);
-            console.error('Error details:', error.stack);
-            
-            // Log submission errors
-            const timestamp = new Date().toISOString();
-            const logEntry = `${timestamp}: BLOCK SUBMISSION ERROR - ${error.message}\n`;
-            require('fs').appendFileSync('./logs/blocks-errors.log', logEntry);
-            
             return null;
         }
-    }
-
-    buildBlockHeader(miner, extranonce2, time, nonce) {
-        const job = this.currentJob;
-        
-        // Construct coinbase transaction with miner's extranonce
-        const coinbase = Buffer.concat([
-            Buffer.from(job.coinb1, 'hex'),
-            Buffer.from(miner.extranonce1, 'hex'),
-            Buffer.from(extranonce2, 'hex'),
-            Buffer.from(job.coinb2, 'hex')
-        ]);
-        
-        // Calculate coinbase hash
-        const coinbaseHash = this.doublesha256(coinbase);
-        
-        // Build merkle root
-        const merkleRoot = this.calculateCorrectMerkleRoot([coinbaseHash.toString('hex'), ...job.merkleSteps]);
-        
-        // Construct 80-byte block header
-        const header = Buffer.alloc(80);
-        let offset = 0;
-        
-        // Version (4 bytes, little endian)
-        header.writeUInt32LE(parseInt(job.version, 16), offset);
-        offset += 4;
-        
-        // Previous block hash (32 bytes, reverse byte order)
-        Buffer.from(job.prevHash, 'hex').reverse().copy(header, offset);
-        offset += 32;
-        
-        // Merkle root (32 bytes, reverse byte order)
-        Buffer.from(merkleRoot, 'hex').reverse().copy(header, offset);
-        offset += 32;
-        
-        // Timestamp (4 bytes, little endian)
-        header.writeUInt32LE(parseInt(time, 16), offset);
-        offset += 4;
-        
-        // Difficulty bits (4 bytes, little endian)
-        header.writeUInt32LE(parseInt(job.nbits, 16), offset);
-        offset += 4;
-        
-        // Nonce (4 bytes, little endian)
-        header.writeUInt32LE(parseInt(nonce, 16), offset);
-        
-        return header;
     }
 
     buildOptimizedBlockHeader(miner, extranonce2, time, nonce) {
         const job = this.currentJob;
         
-        // Use cached coinbase hash if available
         if (!job.cachedCoinbaseTemplate) {
             job.cachedCoinbaseTemplate = Buffer.concat([
                 Buffer.from(job.coinb1, 'hex'),
@@ -704,44 +608,39 @@ class RealStratumServer extends EventEmitter {
             ]);
         }
         
-        // Construct coinbase with new extranonce2
         const coinbase = Buffer.concat([
             job.cachedCoinbaseTemplate,
             Buffer.from(extranonce2, 'hex'),
             Buffer.from(job.coinb2, 'hex')
         ]);
         
-        // Calculate coinbase hash
         const coinbaseHash = this.doublesha256(coinbase);
-        
-        // Build merkle root with corrected algorithm
         const merkleRoot = this.calculateCorrectMerkleRoot([coinbaseHash.toString('hex'), ...job.merkleSteps]);
         
-        // Construct 80-byte block header
         const header = Buffer.alloc(80);
         let offset = 0;
         
-        // Version (4 bytes, little endian)
+        // Version
         header.writeUInt32LE(parseInt(job.version, 16), offset);
         offset += 4;
         
-        // Previous block hash (32 bytes) - job.prevHash is already reversed
+        // Previous block hash
         Buffer.from(job.prevHash, 'hex').copy(header, offset);
         offset += 32;
         
-        // Merkle root (32 bytes, reverse byte order)
+        // Merkle root
         Buffer.from(merkleRoot, 'hex').reverse().copy(header, offset);
         offset += 32;
         
-        // Timestamp (4 bytes, little endian)
+        // Timestamp
         header.writeUInt32LE(parseInt(time, 16), offset);
         offset += 4;
         
-        // Difficulty bits (4 bytes, little endian)
+        // Difficulty bits
         header.writeUInt32LE(parseInt(job.nbits, 16), offset);
         offset += 4;
         
-        // Nonce (4 bytes, little endian)
+        // Nonce
         header.writeUInt32LE(parseInt(nonce, 16), offset);
         
         return header;
@@ -769,10 +668,9 @@ class RealStratumServer extends EventEmitter {
             
             for (let i = 0; i < level.length; i += 2) {
                 const left = Buffer.from(level[i], 'hex').reverse();
-                // Bitcoin protocol: if odd number, duplicate the last hash
                 const right = level[i + 1] ? 
                     Buffer.from(level[i + 1], 'hex').reverse() : 
-                    Buffer.from(level[i], 'hex').reverse(); // Duplicate left
+                    Buffer.from(level[i], 'hex').reverse();
                 
                 const combined = Buffer.concat([left, right]);
                 const hash = this.doublesha256(combined);
@@ -790,6 +688,8 @@ class RealStratumServer extends EventEmitter {
             if (this.shareQueue.length > 0) {
                 const batch = this.shareQueue.splice(0, 100);
                 try {
+                    const validShares = batch.filter(s => s.isValid).length;
+                    
                     for (const share of batch) {
                         await this.db.logShare(
                             share.minerId,
@@ -802,60 +702,16 @@ class RealStratumServer extends EventEmitter {
                             share.processingTime
                         );
                     }
-                    // console.log(`📊 DB: Logged ${batch.length} shares in batch`);
+                    
+                    // Only log significant batches
+                    if (validShares > 0 || batch.some(s => s.meetsNetworkDiff)) {
+                        console.log(`📊 Processed ${batch.length} shares (${validShares} valid)`);
+                    }
                 } catch (error) {
-                    console.error('Batch logging error:', error);
+                    console.error('Batch processing error:', error);
                 }
             }
         }, 5000);
-    }
-
-    checkDifficulty(hash, target) {
-        try {
-            const targetBuffer = this.difficultyToTarget(target);
-            console.log(`DEBUG: Target for difficulty ${target}: ${targetBuffer.toString('hex')}`);
-            
-            const hashCopy = Buffer.from(hash);
-            const result = hashCopy.reverse().compare(targetBuffer) <= 0;
-            console.log(`DEBUG: Hash reversed: ${hashCopy.toString('hex')}`);
-            console.log(`DEBUG: Comparison result: ${result}`);
-            
-            return result;
-        } catch (error) {
-            console.error('Difficulty check error:', error.message);
-            return false;
-        }
-    }
-
-    difficultyToTarget(difficulty) {
-        // Ensure minimum difficulty
-        if (difficulty <= 0) {
-            difficulty = 0.0001; // Very low for testing
-        }
-        
-        // Bitcoin's maximum target (difficulty 1)
-        // This represents the easiest possible target
-        const maxTargetHex = '0x00000000FFFF0000000000000000000000000000000000000000000000000000';
-        const maxTarget = BigInt(maxTargetHex);
-        
-        // For very low difficulties, we need to scale up the target
-        // Lower difficulty = higher target = easier to meet
-        const difficultyScaled = Math.max(difficulty, 0.0001);
-        const targetBig = maxTarget / BigInt(Math.floor(difficultyScaled * 1000000)) * BigInt(1000000);
-        
-        // Ensure target doesn't exceed maximum
-        const finalTarget = targetBig > maxTarget ? maxTarget : targetBig;
-        
-        // Convert to 32-byte buffer (little endian for comparison)
-        let targetHex = finalTarget.toString(16).padStart(64, '0');
-        
-        console.log(`🎯 DIFFICULTY DEBUG:`);
-        console.log(`   Input difficulty: ${difficulty}`);
-        console.log(`   Max target: ${maxTarget.toString(16)}`);
-        console.log(`   Calculated target: ${finalTarget.toString(16)}`);
-        console.log(`   Target buffer: ${targetHex}`);
-        
-        return Buffer.from(targetHex, 'hex');
     }
 
     sendDifficulty(miner) {
@@ -882,7 +738,7 @@ class RealStratumServer extends EventEmitter {
                 this.currentJob.version,
                 this.currentJob.nbits,
                 this.currentJob.ntime,
-                true // clean jobs
+                true
             ]
         };
         this.sendMessage(miner.socket, message);
@@ -904,15 +760,20 @@ class RealStratumServer extends EventEmitter {
         try {
             if (socket && socket.writable && !socket.destroyed) {
                 const data = JSON.stringify(message) + '\n';
+                console.log(`📤 SENDING:`, JSON.stringify(message));
                 socket.write(data, (err) => {
                     if (err) {
-                        console.log(`Write error: ${err.message}`);
+                        console.log(`❌ Write error: ${err.message}`);
                         socket.destroy();
+                    } else {
+                        console.log(`✅ Message sent successfully`);
                     }
                 });
+            } else {
+                console.log(`❌ Cannot send - socket not writable`);
             }
         } catch (err) {
-            console.error('Error sending message:', err.message);
+            console.error('❌ Error sending message:', err.message);
         }
     }
 
@@ -945,7 +806,7 @@ class RealStratumServer extends EventEmitter {
 const server = new RealStratumServer({
     port: 3333,
     difficulty: 1,
-    poolAddress: '1GWVQpX8bnwkQsLYHrdzQqma7vWXbp9zFH' // Change this to your Bitcoin address
+    poolAddress: '1GWVQpX8bnwkQsLYHrdzQqma7vWXbp9zFH'
 });
 
 server.on('validShare', (data) => {
@@ -963,9 +824,8 @@ server.start().then(success => {
 // Display stats every 60 seconds
 setInterval(async () => {
     const stats = server.getStats();
-    // console.log(`📊 Stats: ${stats.totalMiners} miners, ${stats.validShares}/${stats.totalShares} shares (${stats.efficiency}% efficiency) - Queue: ${server.shareQueue.length}`);
+    console.log(`📊 Stats: ${stats.totalMiners} miners, ${stats.validShares}/${stats.totalShares} shares (${stats.efficiency}% efficiency)`);
    
-    // Log to database every 60 seconds as well
     await server.db.logPoolStats(
         stats.totalMiners,
         stats.totalShares,
@@ -980,7 +840,6 @@ setInterval(async () => {
 process.on('SIGINT', () => {
     console.log('\nShutting down real stratum server...');
     
-    // Stop the monitor gracefully
     if (server.monitor) {
         server.monitor.stop();
     }
@@ -993,7 +852,6 @@ process.on('SIGINT', () => {
 process.on('SIGTERM', () => {
     console.log('SIGTERM received, shutting down gracefully');
     
-    // Stop the monitor gracefully
     if (server.monitor) {
         server.monitor.stop();
     }
