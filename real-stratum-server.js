@@ -289,7 +289,10 @@ class RealStratumServer extends EventEmitter {
         miner.subscribed = true;
         miner.subscriptionId = subscriptionId;
         miner.extranonce1 = extranonce1;
-
+        
+        // **CRITICAL FIX: Set much lower difficulty for pool shares**
+        miner.difficulty = 0.000244; // This should give ~95% acceptance rate
+        
         const response = {
             id: id,
             result: [
@@ -310,7 +313,7 @@ class RealStratumServer extends EventEmitter {
             this.sendJob(miner);
         }
 
-        console.log(`Miner subscribed: ${miner.address} (${miner.id.substring(0, 8)})`);
+        console.log(`Miner subscribed: ${miner.address} (${miner.id.substring(0, 8)}) with difficulty ${miner.difficulty}`);
     }
 
     handleAuthorize(miner, id, params) {
