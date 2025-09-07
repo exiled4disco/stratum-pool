@@ -3,6 +3,8 @@ const crypto = require('crypto');
 const EventEmitter = require('events');
 const BitcoinConnector = require('./bitcoin-connector');
 const DatabaseConnector = require('./database');
+const MiningPoolMonitor = require('./monitoring-system');
+
 
 class RealStratumServer extends EventEmitter {
     constructor(config = {}) {
