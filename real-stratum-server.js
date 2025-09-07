@@ -292,14 +292,14 @@ class RealStratumServer extends EventEmitter {
             const name = username.toLowerCase();
             
             if (name.includes('nano') || name.includes('avalon')) {
-                return 1024;  // 6 TH/s Avalon Nano S
+                return 256;  // 6 TH/s Avalon Nano S
             }
             if (name.includes('s9')) {
-                return 2048;  // 13.5 TH/s S9
+                return 512;  // 13.5 TH/s S9
             }
             
             // Default for unknown miners
-            return 1024;
+            return 256;
         }
 
         miner.difficulty = getInitialDifficulty(username);

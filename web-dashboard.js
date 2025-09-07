@@ -176,17 +176,28 @@ class EnhancedDashboard {
     async getEnhancedStats() {
         // Get current active miners with detailed info
         // Replace your minersResult query with this:
+        // Replace the minersResult query with this:
         const minersResult = await this.pool.query(`
             SELECT 
                 m.id, m.username, m.ip_address, m.connected_at, m.disconnected_at,
                 m.total_shares, m.valid_shares,
-                CASE WHEN m.disconnected_at IS NULL THEN true ELSE false END as is_connected,
+                CASE 
+                    WHEN m.disconnected_at IS NULL 
+                    AND m.connected_at >= NOW() - INTERVAL '5 minutes' 
+                    THEN true 
+                    ELSE false 
+                END as is_connected,
                 EXTRACT(EPOCH FROM (COALESCE(m.disconnected_at, NOW()) - m.connected_at)) as connection_duration,
                 COUNT(s.id) as shares_last_hour
             FROM miners m
             LEFT JOIN shares s ON m.id = s.miner_id AND s.submitted_at >= NOW() - INTERVAL '1 hour'
-            WHERE m.disconnected_at IS NULL 
-            AND m.connected_at >= NOW() - INTERVAL '10 minutes'  -- Only recent connections
+            WHERE (
+                -- Only currently connected miners
+                (m.disconnected_at IS NULL AND m.connected_at >= NOW() - INTERVAL '5 minutes')
+                OR 
+                -- Or recently disconnected miners (for history)
+                (m.disconnected_at IS NOT NULL AND m.disconnected_at >= NOW() - INTERVAL '2 minutes')
+            )
             GROUP BY m.id, m.username, m.ip_address, m.connected_at, m.disconnected_at, m.total_shares, m.valid_shares
             ORDER BY m.connected_at DESC
         `);
@@ -207,6 +218,51 @@ class EnhancedDashboard {
             FROM shares 
             WHERE submitted_at >= CURRENT_DATE
         `);
+        
+        // Add this to your web-dashboard.js getEnhancedStats function:
+
+            const timeWindowStats = await this.pool.query(`
+                SELECT 
+                    -- 30 minutes
+                    COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '30 minutes' THEN 1 END) as shares_30m,
+                    COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '30 minutes' AND is_valid THEN 1 END) as valid_30m,
+                    
+                    -- 1 hour  
+                    COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '1 hour' THEN 1 END) as shares_1h,
+                    COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '1 hour' AND is_valid THEN 1 END) as valid_1h,
+                    
+                    -- 6 hours
+                    COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '6 hours' THEN 1 END) as shares_6h,
+                    COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '6 hours' AND is_valid THEN 1 END) as valid_6h,
+                    
+                    -- 12 hours
+                    COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '12 hours' THEN 1 END) as shares_12h,
+                    COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '12 hours' AND is_valid THEN 1 END) as valid_12h,
+                    
+                    -- 24 hours
+                    COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '24 hours' THEN 1 END) as shares_24h,
+                    COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '24 hours' AND is_valid THEN 1 END) as valid_24h
+                FROM shares
+            `);
+
+            const windows = timeWindowStats.rows[0];
+
+            const efficiencyWindows = {
+                efficiency_30m: windows.shares_30m > 0 ? ((windows.valid_30m / windows.shares_30m) * 100).toFixed(1) : '0.0',
+                efficiency_1h: windows.shares_1h > 0 ? ((windows.valid_1h / windows.shares_1h) * 100).toFixed(1) : '0.0',
+                efficiency_6h: windows.shares_6h > 0 ? ((windows.valid_6h / windows.shares_6h) * 100).toFixed(1) : '0.0',
+                efficiency_12h: windows.shares_12h > 0 ? ((windows.valid_12h / windows.shares_12h) * 100).toFixed(1) : '0.0',
+                efficiency_24h: windows.shares_24h > 0 ? ((windows.valid_24h / windows.shares_24h) * 100).toFixed(1) : '0.0'
+            };
+
+            // Add to your return object:
+            return {
+                // ... existing stats ...
+                timeWindows: {
+                    ...windows,
+                    ...efficiencyWindows
+                }
+            };
 
         // Get all-time statistics
         const allTimeResult = await this.pool.query(`
@@ -314,31 +370,33 @@ class EnhancedDashboard {
 
     calculateEstimatedHashrate(miners, sharesLastHour) {
         console.log('=== HASHRATE CALCULATION DEBUG ===');
-        console.log('Miners array length:', miners ? miners.length : 'undefined');
-        console.log('Miners data:', JSON.stringify(miners, null, 2));
+        console.log('Total miners in array:', miners ? miners.length : 0);
         
         if (!miners || !Array.isArray(miners)) {
-            console.log('No miners array provided');
+            console.log('No valid miners array');
             return "0.0";
         }
         
-        // Count connected miners from the database query
+        // Be very strict about what counts as "connected"
         const connectedMiners = miners.filter(m => {
-            const isConnected = m.is_connected === true;
-            console.log(`Miner ${m.username}: is_connected = ${m.is_connected} (${typeof m.is_connected}), counted = ${isConnected}`);
-            return isConnected;
-        }).length;
+            const hasNoDisconnectTime = (m.disconnected_at === null || m.disconnected_at === undefined);
+            const isRecentConnection = new Date(m.connected_at) > new Date(Date.now() - 5 * 60 * 1000); // 5 minutes
+            const isMarkedConnected = m.is_connected === true;
+            
+            const shouldCount = hasNoDisconnectTime && isRecentConnection && isMarkedConnected;
+            
+            console.log(`Miner ${m.username}: disconnected_at=${m.disconnected_at}, is_connected=${m.is_connected}, recent=${isRecentConnection}, counted=${shouldCount}`);
+            return shouldCount;
+        });
         
-        console.log('Connected miners count:', connectedMiners);
+        console.log('Truly connected miners:', connectedMiners.length);
         
-        if (connectedMiners > 0) {
-            // Change from 14 to 13.5 TH/s per S9
-            const hashrate = (connectedMiners * 13.5).toFixed(1);
-            console.log('Final hashrate calculation:', connectedMiners, '× 13.5 TH/s =', hashrate, 'TH/s');
+        if (connectedMiners.length > 0) {
+            const hashrate = (connectedMiners.length * 13.5).toFixed(1);
+            console.log('Calculated hashrate:', hashrate, 'TH/s');
             return hashrate;
         }
         
-        console.log('No connected miners found, returning 0.0');
         return "0.0";
     }
 
