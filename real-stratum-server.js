@@ -380,7 +380,7 @@ class RealStratumServer extends EventEmitter {
         
     async validateShare(miner, jobId, extranonce2, time, nonce) {
         const startTime = Date.now();
-        
+    
         if (!this.currentJob) {
             console.error('No current job available for share validation');
             return false;
@@ -389,41 +389,55 @@ class RealStratumServer extends EventEmitter {
             console.warn(`Invalid job ID ${jobId}; expected ${this.currentJob.jobId}`);
             return false;
         }
-
+        
         // Input validation
-        if (!miner || !extranonce2 || !time || !nonce || 
+        if (!miner || !extranonce2 || !time || !nonce ||
             !/^[0-9a-fA-F]+$/.test(extranonce2) || !/^[0-9a-fA-F]+$/.test(nonce)) {
             console.error('Invalid share parameters');
             return false;
         }
-
+        
         try {
             const blockHeader = this.buildOptimizedBlockHeader(miner, extranonce2, time, nonce);
+        
+            // Add detailed diagnostic logging
+            console.log('=== BLOCK HEADER ANALYSIS ===');
+            console.log('Block header bytes:', blockHeader.length);
+            console.log('Version:', blockHeader.readUInt32LE(0).toString(16));
+            console.log('Prev hash:', blockHeader.subarray(4, 36).toString('hex'));
+            console.log('Merkle root:', blockHeader.subarray(36, 68).toString('hex'));
+            console.log('Timestamp:', blockHeader.readUInt32LE(68).toString(16));
+            console.log('Bits (difficulty):', blockHeader.readUInt32LE(72).toString(16));
+            console.log('Nonce:', blockHeader.readUInt32LE(76).toString(16));
+            console.log('Full header hex:', blockHeader.toString('hex'));
+        
             const hash = this.calculateBlockHash(blockHeader);
             const reversedHash = Buffer.from(hash).reverse();
             const blockHashHex = reversedHash.toString('hex');
-
-            console.log(`Hash: ${blockHashHex.substring(0, 20)}...`);
+            console.log('Raw hash:', hash.toString('hex'));
+            console.log('Reversed hash:', blockHashHex);
+            console.log('===============================');
+        
+            // Debug the difficulty assignment
+            console.log(`🎯 Miner difficulty: ${miner.difficulty}`);
             
-            // Check pool difficulty
+            // Check pool difficulty using the FIXED function
             const poolTarget = this.difficultyToTarget(miner.difficulty);
-            console.log(`DEBUG: Miner ${miner.username} difficulty: ${miner.difficulty}`);
-            console.log(`DEBUG: Pool target: ${poolTarget.toString('hex').substring(0, 20)}...`);
-            console.log(`DEBUG: Hash target:  ${reversedHash.toString('hex').substring(0, 20)}...`);
             const meetsPoolDifficulty = reversedHash.compare(poolTarget) <= 0;
+        
+            console.log(`🎯 Pool target: ${poolTarget.toString('hex').substring(0, 20)}...`);
+            console.log(`🎯 Hash target: ${reversedHash.toString('hex').substring(0, 20)}...`);
+            console.log(`🎯 Meets pool difficulty: ${meetsPoolDifficulty}`);
             
-            console.log(`Meets pool difficulty: ${meetsPoolDifficulty}`);
-
             // Check network difficulty
             const networkDifficulty = await this.getNetworkTarget();
             const networkTarget = this.difficultyToTarget(networkDifficulty);
             const meetsNetworkDifficulty = reversedHash.compare(networkTarget) <= 0;
-
-            console.log(`Meets network difficulty: ${meetsNetworkDifficulty}`);
-
+            console.log(`🎯 Meets network difficulty: ${meetsNetworkDifficulty}`);
+            
             // Calculate processing time
             const processingTime = Date.now() - startTime;
-
+            
             // Queue share for batch database logging
             this.shareQueue.push({
                 minerId: miner.id,
@@ -435,23 +449,19 @@ class RealStratumServer extends EventEmitter {
                 blockHash: blockHashHex,
                 processingTime
             });
-
-            // Record share validation for monitoring
-            this.monitor.recordShareValidation(miner.id, meetsPoolDifficulty, processingTime);
-            
+        
             if (meetsNetworkDifficulty) {
                 console.log('🎉 BLOCK FOUND! Hash:', blockHashHex);
                 await this.db.logBlockFound(miner.id, blockHashHex, this.currentJob.height);
                 await this.submitFoundBlock(blockHeader, miner, extranonce2);
             }
-
+            
             return meetsPoolDifficulty;
         } catch (error) {
             console.error('Validation error:', error.message);
             return false;
         }
     }
-
     encodeVarint(num) {
         if (num < 0xFD) {
             return Buffer.from([num]).toString('hex');
@@ -830,13 +840,14 @@ class RealStratumServer extends EventEmitter {
         // Bitcoin's maximum target (difficulty 1)
         const maxTarget = BigInt('0x00000000FFFF0000000000000000000000000000000000000000000000000000');
         
-        // Simple division - no scaling needed
-        const target = maxTarget / BigInt(Math.floor(difficulty));
+        // Convert difficulty to BigInt to handle large numbers
+        const difficultyBig = BigInt(Math.floor(difficulty * 1000000)); // Scale up to avoid floating point
+        const scaledMaxTarget = maxTarget * BigInt(1000000); // Scale max target accordingly
+        
+        const target = scaledMaxTarget / difficultyBig;
         
         // Convert to 32-byte buffer
         const targetHex = target.toString(16).padStart(64, '0');
-        console.log(`🎯 DIFFICULTY DEBUG: diff=${difficulty} → target=${targetHex.substring(0, 16)}...`);
-
         return Buffer.from(targetHex, 'hex');
     }
 
