@@ -282,38 +282,35 @@ class RealStratumServer extends EventEmitter {
         }
     }
 
-    handleSubscribe(miner, id, params) {
-        const subscriptionId = crypto.randomBytes(4).toString('hex');
-        const extranonce1 = crypto.randomBytes(4).toString('hex');
+    handleAuthorize(miner, id, params) {
+        const [username, password] = params;
         
-        miner.subscribed = true;
-        miner.subscriptionId = subscriptionId;
-        miner.extranonce1 = extranonce1;
+        miner.authorized = true;
+        miner.username = username;
         
-        // **CRITICAL FIX: Set much lower difficulty for pool shares**
-        miner.difficulty = 0.000244; // This should give ~95% acceptance rate
+        // ❌ REMOVE THIS LINE - it's overriding the low difficulty from handleSubscribe
+        // miner.difficulty = 1;  // Start very low, adjust dynamically
+        
+        // Keep the tracking variables
+        miner.shareCount = 0;
+        miner.validShares = 0;
+        miner.lastDifficultyAdjust = Date.now();
+        
+        // Log to database
+        this.db.logMinerConnection(miner.id, username, miner.address);
         
         const response = {
             id: id,
-            result: [
-                [
-                    ["mining.set_difficulty", subscriptionId],
-                    ["mining.notify", subscriptionId]
-                ],
-                extranonce1,
-                4
-            ],
+            result: true,
             error: null
         };
 
         this.sendMessage(miner.socket, response);
+        
+        // Send current difficulty (don't change it here)
         this.sendDifficulty(miner);
         
-        if (this.currentJob) {
-            this.sendJob(miner);
-        }
-
-        console.log(`Miner subscribed: ${miner.address} (${miner.id.substring(0, 8)}) with difficulty ${miner.difficulty}`);
+        console.log(`Miner authorized: ${username} from ${miner.address} - Using difficulty ${miner.difficulty} (set in subscribe)`);
     }
 
     handleAuthorize(miner, id, params) {
