@@ -121,6 +121,8 @@ class RealStratumServer extends EventEmitter {
      * Convert difficulty to target value
      */
     difficultyToTarget(difficulty) {
+        console.log(`🔧 difficultyToTarget called with: ${difficulty}`);
+        
         if (difficulty <= 0) {
             difficulty = 0.00001;
         }
@@ -129,15 +131,32 @@ class RealStratumServer extends EventEmitter {
         const maxTargetHex = '00000000FFFF0000000000000000000000000000000000000000000000000000';
         const maxTarget = BigInt('0x' + maxTargetHex);
         
-        if (difficulty < 1.0) {
-            // For difficulties less than 1, just use the maximum target
-            return Buffer.from(maxTargetHex, 'hex');
+        const diffFloat = parseFloat(difficulty);
+        let targetBig;
+        
+        if (diffFloat >= 1.0) {
+            // For difficulty >= 1: target = maxTarget / floor(difficulty)
+            const d = BigInt(Math.floor(diffFloat));
+            targetBig = maxTarget / d;
         } else {
-            // For difficulties >= 1, calculate normally
-            const targetBig = maxTarget / BigInt(Math.floor(difficulty));
-            const targetHex = targetBig.toString(16).padStart(64, '0');
-            return Buffer.from(targetHex, 'hex');
+            // For difficulty < 1: target = maxTarget * (1 / difficulty)
+            // Use scaling for precision (10^18)
+            const scale = 1000000000000000000n; // 1e18
+            const recipFloat = 1.0 / diffFloat;
+            // Round to nearest integer for recip * scale
+            const recipBigApprox = BigInt(Math.floor(recipFloat * Number(scale)) + 0.5);
+            targetBig = (maxTarget * recipBigApprox) / scale;
+            
+            // Cap at maximum 256-bit value if overflow (all hashes would pass, but unlikely for your diffs)
+            const maxUint256 = (1n << 256n) - 1n;
+            if (targetBig > maxUint256) {
+                targetBig = maxUint256;
+            }
         }
+        
+        const targetHex = targetBig.toString(16).padStart(64, '0');
+        console.log(`🔧 Computed target hex (first 16 chars): ${targetHex.substring(0, 16)}`);
+        return Buffer.from(targetHex, 'hex');
     }
 
     /**
@@ -155,7 +174,7 @@ class RealStratumServer extends EventEmitter {
         // Only adjust every 60 seconds minimum
         if (timeSinceLastAdjust < 60000) return;
         
-        const targetSharesPerMinute = 4;
+        const targetSharesPerMinute = 6; // Adjusted for S9
         const timeWindowMinutes = Math.min(timeSinceLastAdjust / 60000, 10);
         const actualSharesPerMinute = (miner.validShares || 0) / timeWindowMinutes;
         
@@ -163,7 +182,7 @@ class RealStratumServer extends EventEmitter {
         
         // Adjust difficulty based on share rate
         if (actualSharesPerMinute > targetSharesPerMinute * 1.5) {
-            newDifficulty = Math.min(miner.difficulty * 2, 1);
+            newDifficulty = miner.difficulty * 2; // No cap or high cap like 100000
         } else if (actualSharesPerMinute < targetSharesPerMinute * 0.5 && miner.validShares > 5) {
             newDifficulty = Math.max(miner.difficulty * 0.5, 0.00001);
         }
@@ -185,7 +204,7 @@ class RealStratumServer extends EventEmitter {
             socket: socket,
             subscribed: false,
             authorized: false,
-            difficulty: 0.0001,
+            difficulty: 1, // Start at 1 for ASICs like S9, adjust up
             lastActivity: Date.now(),
             address: socket.remoteAddress,
             shares: 0,
@@ -260,7 +279,7 @@ class RealStratumServer extends EventEmitter {
         const messages = data.toString().trim().split('\n');
         
         for (const messageStr of messages) {
-            if (!messageStr.trim()) continue;
+            if (!messageStr.trim() || !messageStr.startsWith('{')) continue; // Skip non-JSON
             
             try {
                 const message = JSON.parse(messageStr);
@@ -326,7 +345,7 @@ class RealStratumServer extends EventEmitter {
         miner.subscribed = true;
         miner.subscriptionId = subscriptionId;
         miner.extranonce1 = extranonce1;
-        miner.difficulty = 0.0001; // Start low for S9
+        miner.difficulty = 1; // Start at 1 for ASICs like S9, adjust up
         miner.shareCount = 0;
         miner.validShares = 0;
         miner.lastDifficultyAdjust = Date.now();
@@ -380,10 +399,11 @@ class RealStratumServer extends EventEmitter {
             return;
         }
 
-        const [username, jobId, extranonce2, time, nonce] = params;
+        const [username, jobId, extranonce2, time, nonce, versionRolled = null] = params;  // Capture 6th param
         miner.shares++;
         
-        const isValid = await this.validateShare(miner, jobId, extranonce2, time, nonce);
+        // Pass versionRolled to validateShare
+        const isValid = await this.validateShare(miner, jobId, extranonce2, time, nonce, versionRolled);
         
         if (isValid) {
             miner.validShares++;
@@ -404,47 +424,67 @@ class RealStratumServer extends EventEmitter {
         }
     }
         
-    async validateShare(miner, jobId, extranonce2, time, nonce) {
-        // Basic validation
+    async validateShare(miner, jobId, extranonce2, time, nonce, versionRolled = null) {
+        console.log(`🔍 Validating share for ${miner.username}: jobId=${jobId}, extranonce2=${extranonce2}, time=${time}, nonce=${nonce}, versionRolled=${versionRolled}`);
+        
+        // Validate job and parameters
         if (!this.currentJob || jobId !== this.currentJob.jobId) {
+            console.log(`❌ Invalid share: Job ${jobId} not found or stale`);
             return false;
         }
         
         if (!extranonce2 || !time || !nonce || 
             !/^[0-9a-fA-F]+$/.test(extranonce2) || 
+            !/^[0-9a-fA-F]+$/.test(time) || 
             !/^[0-9a-fA-F]+$/.test(nonce)) {
+            console.log(`❌ Invalid share: Malformed parameters (extranonce2=${extranonce2}, time=${time}, nonce=${nonce})`);
             return false;
         }
         
+        // Validate version rolling if provided
+        if (versionRolled) {
+            if (!/^[0-9a-fA-F]+$/.test(versionRolled)) {
+                console.log(`❌ Invalid share: Malformed versionRolled=${versionRolled}`);
+                return false;
+            }
+            const version = parseInt(versionRolled, 16);
+            const baseVersion = parseInt(this.currentJob.version, 16);
+            const mask = 0x1fffe000; // From mining.configure
+            if ((version & ~mask) !== (baseVersion & ~mask)) {
+                console.log(`❌ Invalid share: Rolled version ${versionRolled} does not match mask 1fffe000`);
+                return false;
+            }
+        }
+        
         try {
-            const blockHeader = this.buildOptimizedBlockHeader(miner, extranonce2, time, nonce);
+            // Construct block header with rolled version
+            const blockHeader = this.buildOptimizedBlockHeader(miner, extranonce2, time, nonce, versionRolled);
             const hash = this.calculateBlockHash(blockHeader);
             const reversedHash = Buffer.from(hash).reverse();
             
             // Pool difficulty check
             const poolTarget = this.difficultyToTarget(miner.difficulty);
             
-            // ADD THIS DEBUG LINE:
-            console.log(`DEBUG: Diff=${miner.difficulty}, Target=${poolTarget.toString('hex').substring(0,16)}..., Hash=${reversedHash.toString('hex').substring(0,16)}..., Compare=${reversedHash.compare(poolTarget)}`);
+            console.log(`DEBUG: Diff=${miner.difficulty}, Target=${poolTarget.toString('hex').substring(0, 16)}..., Hash=${reversedHash.toString('hex').substring(0, 16)}..., Compare=${reversedHash.compare(poolTarget)}`);
             
-            const meetsPoolDifficulty = reversedHash.compare(poolTarget) <= 0;
+            const meetsPoolDifficulty = this.meetsTarget(hash, poolTarget);
             
             // Network difficulty check for block finding
             let meetsNetworkDifficulty = false;
             if (meetsPoolDifficulty) {
                 const networkDifficulty = await this.getNetworkTarget();
                 const networkTarget = this.difficultyToTarget(networkDifficulty);
-                meetsNetworkDifficulty = reversedHash.compare(networkTarget) <= 0;
+                meetsNetworkDifficulty = this.meetsTarget(hash, networkTarget);
                 
                 if (meetsNetworkDifficulty) {
-                    console.log('BLOCK FOUND!');
+                    console.log('🎉 BLOCK FOUND!');
                     const blockHash = reversedHash.toString('hex');
                     await this.db.logBlockFound(miner.id, blockHash, this.currentJob.height);
                     await this.submitFoundBlock(blockHeader, miner, extranonce2);
                 }
             }
             
-            // Queue for database logging
+            // Queue share for database logging
             this.shareQueue.push({
                 minerId: miner.id,
                 jobId,
@@ -453,13 +493,14 @@ class RealStratumServer extends EventEmitter {
                 meetsPoolDiff: meetsPoolDifficulty,
                 meetsNetworkDiff: meetsNetworkDifficulty,
                 blockHash: reversedHash.toString('hex'),
-                processingTime: 1
+                processingTime: Date.now() - miner.lastActivity
             });
             
+            console.log(`🔍 Share validation result: ${meetsPoolDifficulty ? 'Valid' : 'Invalid'}`);
             return meetsPoolDifficulty;
             
         } catch (error) {
-            console.error('Share validation error:', error.message);
+            console.error(`❌ Share validation error for ${miner.username}:`, error.message);
             return false;
         }
     }
@@ -598,7 +639,7 @@ class RealStratumServer extends EventEmitter {
         }
     }
 
-    buildOptimizedBlockHeader(miner, extranonce2, time, nonce) {
+    buildOptimizedBlockHeader(miner, extranonce2, time, nonce, versionRolled = null) {
         const job = this.currentJob;
         
         if (!job.cachedCoinbaseTemplate) {
@@ -620,8 +661,9 @@ class RealStratumServer extends EventEmitter {
         const header = Buffer.alloc(80);
         let offset = 0;
         
-        // Version
-        header.writeUInt32LE(parseInt(job.version, 16), offset);
+        // Version: Use rolled version if provided, else job default
+        const version = versionRolled ? parseInt(versionRolled, 16) : parseInt(job.version, 16);
+        header.writeUInt32LE(version, offset);
         offset += 4;
         
         // Previous block hash
@@ -643,6 +685,8 @@ class RealStratumServer extends EventEmitter {
         // Nonce
         header.writeUInt32LE(parseInt(nonce, 16), offset);
         
+        // Debug: Log the constructed header
+        console.log(`🔧 Constructed block header: ${header.toString('hex')}`);
         return header;
     }
 
@@ -687,6 +731,7 @@ class RealStratumServer extends EventEmitter {
         setInterval(async () => {
             if (this.shareQueue.length > 0) {
                 const batch = this.shareQueue.splice(0, 100);
+                console.log(`📦 Processing batch of ${batch.length} shares...`);
                 try {
                     const validShares = batch.filter(s => s.isValid).length;
                     
