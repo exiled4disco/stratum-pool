@@ -185,7 +185,8 @@ class EnhancedDashboard {
                 COUNT(s.id) as shares_last_hour
             FROM miners m
             LEFT JOIN shares s ON m.id = s.miner_id AND s.submitted_at >= NOW() - INTERVAL '1 hour'
-            WHERE m.disconnected_at IS NULL  -- Only currently connected miners
+            WHERE m.disconnected_at IS NULL 
+            AND m.connected_at >= NOW() - INTERVAL '10 minutes'  -- Only recent connections
             GROUP BY m.id, m.username, m.ip_address, m.connected_at, m.disconnected_at, m.total_shares, m.valid_shares
             ORDER BY m.connected_at DESC
         `);
