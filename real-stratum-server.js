@@ -143,7 +143,7 @@ class RealStratumServer extends EventEmitter {
         this.monitor.recordMinerConnection(minerId, 'new-connection', socket.remoteAddress);
 
         // Set socket timeout to prevent hanging connections
-        socket.setTimeout(120000); // 2 minutes
+        socket.setTimeout(300000); // 2 minutes
 
         const keepAlive = setInterval(() => {
             if (socket.writable && !socket.destroyed) {

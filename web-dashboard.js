@@ -175,6 +175,7 @@ class EnhancedDashboard {
 
     async getEnhancedStats() {
         // Get current active miners with detailed info
+        // Replace your minersResult query with this:
         const minersResult = await this.pool.query(`
             SELECT 
                 m.id, m.username, m.ip_address, m.connected_at, m.disconnected_at,
@@ -184,7 +185,7 @@ class EnhancedDashboard {
                 COUNT(s.id) as shares_last_hour
             FROM miners m
             LEFT JOIN shares s ON m.id = s.miner_id AND s.submitted_at >= NOW() - INTERVAL '1 hour'
-            WHERE m.disconnected_at IS NULL OR m.disconnected_at >= NOW() - INTERVAL '5 minutes'
+            WHERE m.disconnected_at IS NULL  -- Only currently connected miners
             GROUP BY m.id, m.username, m.ip_address, m.connected_at, m.disconnected_at, m.total_shares, m.valid_shares
             ORDER BY m.connected_at DESC
         `);
@@ -194,6 +195,7 @@ class EnhancedDashboard {
             SELECT 
                 COUNT(*) as total_shares_today,
                 COUNT(CASE WHEN is_valid THEN 1 END) as valid_shares_today,
+                COUNT(CASE WHEN NOT is_valid THEN 1 END) as rejected_shares_today,
                 COUNT(CASE WHEN meets_network_difficulty THEN 1 END) as blocks_found_today,
                 AVG(processing_time_ms) as avg_processing_time,
                 MIN(processing_time_ms) as min_processing_time,
@@ -247,46 +249,42 @@ class EnhancedDashboard {
 
         const shares = sharesResult.rows[0];
         const allTime = allTimeResult.rows[0];
-        const poolStats = poolStatsResult.rows[0] || {};
-        
-        // Calculate efficiency and performance metrics
+        const poolStats = poolStatsResult.rows[0] || {};       
         const efficiency = shares.total_shares_today > 0 ? 
             ((shares.valid_shares_today / shares.total_shares_today) * 100).toFixed(1) : '0.0';
         
         const allTimeEfficiency = allTime.total_shares_all_time > 0 ? 
             ((allTime.valid_shares_all_time / allTime.total_shares_all_time) * 100).toFixed(1) : '0.0';
-
-        // Calculate shares per minute
         const sharesPerMinute = shares.shares_last_hour > 0 ? (shares.shares_last_hour / 60).toFixed(1) : '0.0';
-
-        // Calculate estimated hashrate (rough approximation)
         const estimatedHashrate = this.calculateEstimatedHashrate(minersResult.rows, shares.shares_last_hour);
-
-        // Calculate uptime percentage (very rough estimate)
         const uptimePercent = this.calculateUptimePercent(minersResult.rows);
 
-        return {
-            miners: minersResult.rows,
-            stats: {
-                totalMiners: minersResult.rows.filter(m => m.is_connected).length,
-                totalShares: parseInt(shares.total_shares_today) || 0,
-                validShares: parseInt(shares.valid_shares_today) || 0,
-                blocksFound: parseInt(shares.blocks_found_today) || 0,
-                totalBlocksAllTime: parseInt(allTime.total_blocks_found) || 0,
-                efficiency: efficiency,
-                allTimeEfficiency: allTimeEfficiency,
-                avgProcessingTime: parseFloat(shares.avg_processing_time) || 0,
-                minProcessingTime: parseFloat(shares.min_processing_time) || 0,
-                maxProcessingTime: parseFloat(shares.max_processing_time) || 0,
-                stddevProcessingTime: parseFloat(shares.stddev_processing_time) || 0,
-                currentBlockHeight: poolStats.current_block_height || 0,
-                networkDifficulty: poolStats.network_difficulty || 0,
-                sharesPerMinute: parseFloat(sharesPerMinute),
-                sharesLastHour: parseInt(shares.shares_last_hour) || 0,
-                estimatedHashrate: estimatedHashrate,
-                uptimePercent: uptimePercent,
-                lastShareTime: allTime.last_share_time
-            },
+    console.log('=== API RESPONSE DEBUG ===');
+    console.log('Connected miners from query:', minersResult.rows.filter(m => m.is_connected).length);
+    console.log('Calculated hashrate:', estimatedHashrate);
+
+    return {
+        miners: minersResult.rows,
+        stats: {
+            totalMiners: minersResult.rows.filter(m => m.is_connected).length,
+            totalShares: parseInt(shares.total_shares_today) || 0,
+            validShares: parseInt(shares.valid_shares_today) || 0,
+            blocksFound: parseInt(shares.blocks_found_today) || 0,
+            totalBlocksAllTime: parseInt(allTime.total_blocks_found) || 0,
+            efficiency: efficiency,
+            allTimeEfficiency: allTimeEfficiency,
+            avgProcessingTime: parseFloat(shares.avg_processing_time) || 0,
+            minProcessingTime: parseFloat(shares.min_processing_time) || 0,
+            maxProcessingTime: parseFloat(shares.max_processing_time) || 0,
+            stddevProcessingTime: parseFloat(shares.stddev_processing_time) || 0,
+            currentBlockHeight: poolStats.current_block_height || 0,
+            networkDifficulty: poolStats.network_difficulty || 0,
+            sharesPerMinute: parseFloat(sharesPerMinute),
+            sharesLastHour: parseInt(shares.shares_last_hour) || 0,
+            estimatedHashrate: parseFloat(estimatedHashrate),
+            uptimePercent: uptimePercent,
+            lastShareTime: allTime.last_share_time
+        },
             recentActivity: activityResult.rows,
             blocksFound: blocksResult.rows,
             performance: {
@@ -320,8 +318,9 @@ class EnhancedDashboard {
         console.log('Connected miners count:', connectedMiners);
         
         if (connectedMiners > 0) {
-            const hashrate = (connectedMiners * 14).toFixed(1);
-            console.log('Final hashrate calculation:', connectedMiners, '× 14 TH/s =', hashrate, 'TH/s');
+            // Change from 14 to 13.5 TH/s per S9
+            const hashrate = (connectedMiners * 13.5).toFixed(1);
+            console.log('Final hashrate calculation:', connectedMiners, '× 13.5 TH/s =', hashrate, 'TH/s');
             return hashrate;
         }
         
@@ -330,19 +329,37 @@ class EnhancedDashboard {
     }
 
     calculateUptimePercent(miners) {
-        if (miners.length === 0) return 0;
+        if (miners.length === 0) return "0.0";
         
-        // Very rough uptime calculation based on connection durations
-        const oneDaySeconds = 24 * 60 * 60;
-        let totalUptime = 0;
+        const now = Date.now();
+        const oneDayMs = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+        
+        let totalPossibleUptime = 0;
+        let totalActualUptime = 0;
         
         miners.forEach(miner => {
-            const duration = Math.min(miner.connection_duration || 0, oneDaySeconds);
-            totalUptime += duration;
+            const connectedAt = new Date(miner.connected_at).getTime();
+            const disconnectedAt = miner.disconnected_at ? 
+                new Date(miner.disconnected_at).getTime() : now;
+            
+            // Only consider last 24 hours
+            const startTime = Math.max(connectedAt, now - oneDayMs);
+            const endTime = Math.min(disconnectedAt, now);
+            
+            if (endTime > startTime) {
+                const sessionDuration = endTime - startTime;
+                totalActualUptime += sessionDuration;
+            }
         });
         
-        const maxPossibleUptime = miners.length * oneDaySeconds;
-        return maxPossibleUptime > 0 ? ((totalUptime / maxPossibleUptime) * 100).toFixed(1) : '0.0';
+        // Calculate total possible uptime for all miners in last 24 hours
+        totalPossibleUptime = miners.length * oneDayMs;
+        
+        if (totalPossibleUptime > 0) {
+            return ((totalActualUptime / totalPossibleUptime) * 100).toFixed(1);
+        }
+        
+        return "0.0";
     }
 
     async getHashrateHistory(hours = 24) {
