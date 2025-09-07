@@ -5,6 +5,218 @@ const BitcoinConnector = require('./bitcoin-connector');
 const DatabaseConnector = require('./database');
 const MiningPoolMonitor = require('./monitoring-system');
 
+// Add this to your real-stratum-server.js
+// Dynamic Difficulty Management System
+
+class DynamicDifficultyManager {
+    constructor() {
+        this.targetSharesPerMinute = 4; // Target shares per minute per miner
+        this.adjustmentInterval = 60000; // Adjust every 60 seconds
+        this.minDifficulty = 1024;      // Minimum difficulty
+        this.maxDifficulty = 1000000;   // Maximum difficulty
+        this.difficultyHistory = new Map(); // Track per-miner history
+    }
+
+    // Calculate ideal difficulty for a miner based on their hashrate
+    calculateTargetDifficulty(estimatedHashrate) {
+        // Formula: hashrate / (target_shares_per_minute * 2^32 / 60)
+        const sharesPerSecond = this.targetSharesPerMinute / 60;
+        const difficulty = estimatedHashrate / (sharesPerSecond * Math.pow(2, 32));
+        
+        // Clamp to min/max bounds
+        return Math.max(this.minDifficulty, Math.min(this.maxDifficulty, Math.floor(difficulty)));
+    }
+
+    // Estimate hashrate based on recent share submissions
+    estimateHashrateFromShares(miner, timeWindowMs = 300000) { // 5 minute window
+        const now = Date.now();
+        const recentShares = miner.shareHistory?.filter(share => 
+            (now - share.timestamp) < timeWindowMs
+        ) || [];
+
+        if (recentShares.length < 3) {
+            // Not enough data, use hardware estimate
+            return this.getHardwareHashrateEstimate(miner);
+        }
+
+        const timeSpan = timeWindowMs / 1000; // Convert to seconds
+        const averageDifficulty = recentShares.reduce((sum, share) => 
+            sum + share.difficulty, 0) / recentShares.length;
+        
+        // Hashrate = shares * difficulty * 2^32 / time
+        const estimatedHashrate = (recentShares.length * averageDifficulty * Math.pow(2, 32)) / timeSpan;
+        
+        return estimatedHashrate;
+    }
+
+    // Hardware-based hashrate estimates
+    getHardwareHashrateEstimate(miner) {
+        const username = miner.username?.toLowerCase() || '';
+        
+        // Common miner identification patterns
+        if (username.includes('s9')) return 13.5e12;      // S9: 13.5 TH/s
+        if (username.includes('s19')) return 95e12;       // S19: 95 TH/s
+        if (username.includes('s21')) return 200e12;      // S21: 200 TH/s
+        if (username.includes('m30')) return 112e12;      // M30S: 112 TH/s
+        if (username.includes('m50')) return 126e12;      // M50: 126 TH/s
+        
+        // Avalon miners
+        if (username.includes('nano') || username.includes('avalon')) {
+            if (username.includes('nano')) return 6e12;   // Avalon Nano S: 6 TH/s
+            return 8e12;                                   // Other Avalon: ~8 TH/s average
+        }
+        
+        // Try to detect by worker name patterns
+        if (username.includes('6th') || username.includes('6t')) return 6e12;
+        if (username.includes('13th') || username.includes('13t')) return 13.5e12;
+        if (username.includes('14th') || username.includes('14t')) return 14e12;
+        
+        // Default to conservative estimate for unknown miners
+        return 8e12; // 8 TH/s - safe middle ground
+    }
+
+    // Adjust miner difficulty based on performance
+    adjustMinerDifficulty(miner) {
+        if (!miner.authorized || !miner.subscribed) return;
+
+        // Get current estimated hashrate
+        const estimatedHashrate = this.estimateHashrateFromShares(miner);
+        
+        // Calculate target difficulty
+        const targetDifficulty = this.calculateTargetDifficulty(estimatedHashrate);
+        
+        // Only adjust if change is significant (>20% difference)
+        const currentDiff = miner.difficulty || this.minDifficulty;
+        const changeRatio = Math.abs(targetDifficulty - currentDiff) / currentDiff;
+        
+        if (changeRatio > 0.2) {
+            const oldDifficulty = miner.difficulty;
+            miner.difficulty = targetDifficulty;
+            
+            console.log(`📊 Adjusted difficulty for ${miner.username}: ${oldDifficulty} → ${targetDifficulty} (${(estimatedHashrate/1e12).toFixed(1)} TH/s)`);
+            
+            // Send new difficulty to miner
+            this.sendDifficulty(miner);
+            
+            // Log the adjustment
+            this.logDifficultyAdjustment(miner, oldDifficulty, targetDifficulty, estimatedHashrate);
+        }
+    }
+
+    // Calculate pool-wide target based on total hashrate
+    calculatePoolTarget(totalEstimatedHashrate) {
+        // Scale pool difficulty based on total pool hashrate
+        // Aim for ~200-500 total shares per minute across entire pool
+        const targetPoolSharesPerMinute = Math.max(200, Math.min(500, totalEstimatedHashrate / 1e12 * 2));
+        
+        const sharesPerSecond = targetPoolSharesPerMinute / 60;
+        const poolTargetDifficulty = totalEstimatedHashrate / (sharesPerSecond * Math.pow(2, 32));
+        
+        return poolTargetDifficulty;
+    }
+
+    // Track share for difficulty adjustment
+    recordShare(miner, difficulty, isValid) {
+        if (!miner.shareHistory) {
+            miner.shareHistory = [];
+        }
+
+        miner.shareHistory.push({
+            timestamp: Date.now(),
+            difficulty: difficulty,
+            isValid: isValid
+        });
+
+        // Keep only last 100 shares for memory efficiency
+        if (miner.shareHistory.length > 100) {
+            miner.shareHistory = miner.shareHistory.slice(-100);
+        }
+    }
+
+    // Get scaling recommendations
+    getScalingRecommendations(totalHashrate, minerCount) {
+        const recommendations = [];
+        
+        if (totalHashrate > 1000e12) { // > 1 PH/s
+            recommendations.push({
+                type: 'infrastructure',
+                message: `At ${(totalHashrate/1e15).toFixed(1)} PH/s, consider multiple stratum servers for load balancing`
+            });
+        }
+
+        if (minerCount > 1000) {
+            recommendations.push({
+                type: 'database',
+                message: `${minerCount} miners may require database optimization and connection pooling`
+            });
+        }
+
+        const dailyShares = (totalHashrate / Math.pow(2, 32)) * 86400 / 4; // Rough estimate
+        if (dailyShares > 1000000) { // > 1M shares per day
+            recommendations.push({
+                type: 'storage',
+                message: `${Math.floor(dailyShares/1000)}K shares/day - implement share archiving strategy`
+            });
+        }
+
+        return recommendations;
+    }
+
+    logDifficultyAdjustment(miner, oldDiff, newDiff, hashrate) {
+        // Could log to database or file for analysis
+        console.log(`Difficulty adjustment: ${miner.username} ${oldDiff}→${newDiff} (~${(hashrate/1e12).toFixed(1)}TH/s)`);
+    }
+}
+
+// Integration with your existing RealStratumServer class:
+
+// Add to constructor:
+this.difficultyManager = new DynamicDifficultyManager();
+
+// In handleAuthorize, replace the static difficulty assignment:
+handleAuthorize(miner, id, params) {
+    const [username, password] = params;
+    
+    miner.authorized = true;
+    miner.username = username;
+    
+    // Dynamic difficulty based on estimated hardware
+    const estimatedHashrate = this.difficultyManager.getHardwareHashrateEstimate(miner);
+    miner.difficulty = this.difficultyManager.calculateTargetDifficulty(estimatedHashrate);
+    
+    console.log(`🔐 ${username} authorized with initial difficulty ${miner.difficulty} (~${(estimatedHashrate/1e12).toFixed(1)} TH/s)`);
+    
+    // ... rest of your existing code
+}
+
+// In validateShare, record the share for difficulty tracking:
+if (isValid) {
+    miner.validShares++;
+    this.difficultyManager.recordShare(miner, miner.difficulty, true);
+} else {
+    this.difficultyManager.recordShare(miner, miner.difficulty, false);
+}
+
+// Add periodic difficulty adjustment (add to your existing intervals):
+setInterval(() => {
+    for (const [minerId, miner] of this.miners) {
+        if (miner.authorized) {
+            this.difficultyManager.adjustMinerDifficulty(miner);
+        }
+    }
+    
+    // Calculate total pool stats
+    const totalHashrate = Array.from(this.miners.values())
+        .filter(m => m.authorized)
+        .reduce((sum, m) => sum + this.difficultyManager.estimateHashrateFromShares(m), 0);
+    
+    const recommendations = this.difficultyManager.getScalingRecommendations(totalHashrate, this.miners.size);
+    recommendations.forEach(rec => {
+        console.log(`💡 ${rec.type.toUpperCase()}: ${rec.message}`);
+    });
+    
+}, 60000); // Adjust every minute
+
 class RealStratumServer extends EventEmitter {
     constructor(config = {}) {
         super();
@@ -287,7 +499,7 @@ class RealStratumServer extends EventEmitter {
         
         miner.authorized = true;
         miner.username = username;
-        miner.difficulty = 1; // Force difficulty 1
+        miner.difficulty = 1;
         
         // Log to database
         this.db.logMinerConnection(miner.id, username, miner.address);
@@ -368,7 +580,8 @@ class RealStratumServer extends EventEmitter {
             console.log(`Hash: ${blockHashHex.substring(0, 20)}...`);
             
             // Check pool difficulty
-            const poolTarget = Buffer.from('ff00000000000000000000000000000000000000000000000000000000000000', 'hex');
+            const poolTarget = Buffer.from('0000100000000000000000000000000000000000000000000000000000000000', 'hex');
+
             const meetsPoolDifficulty = reversedHash.compare(poolTarget) <= 0;
             
             console.log(`Meets pool difficulty: ${meetsPoolDifficulty}`);

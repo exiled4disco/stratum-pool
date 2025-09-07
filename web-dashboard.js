@@ -267,6 +267,8 @@ class EnhancedDashboard {
         const sharesPerMinute = recentShares.shares_last_5min > 0 ? 
             (recentShares.shares_last_5min / 5).toFixed(1) : '0.0';
         const uptimePercent = this.calculateUptimePercent(minersResult.rows);
+        const estimatedHashrate = this.calculateEstimatedHashrate(minersResult.rows, shares.shares_last_hour);
+
 
     console.log('=== API RESPONSE DEBUG ===');
     console.log('Connected miners from query:', minersResult.rows.filter(m => m.is_connected).length);
