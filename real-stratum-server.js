@@ -120,6 +120,37 @@ class RealStratumServer extends EventEmitter {
         });
     }
 
+    // Add this method to your RealStratumServer class:
+    adjustMinerDifficulty(miner) {
+        const now = Date.now();
+        const timeSinceLastAdjust = now - (miner.lastDifficultyAdjust || now);
+        
+        // Only adjust every 30 seconds minimum
+        if (timeSinceLastAdjust < 30000) return;
+        
+        const targetSharesPerMinute = 4; // Aim for 4 shares per minute
+        const timeWindowMs = Math.min(timeSinceLastAdjust, 60000); // Max 1 minute window
+        const actualSharesPerMinute = (miner.validShares || 0) / (timeWindowMs / 60000);
+        
+        let newDifficulty = miner.difficulty;
+        
+        if (actualSharesPerMinute > targetSharesPerMinute * 1.5) {
+            // Too many shares - increase difficulty
+            newDifficulty = Math.min(miner.difficulty * 1.5, 65536); // Max difficulty
+        } else if (actualSharesPerMinute < targetSharesPerMinute * 0.5) {
+            // Too few shares - decrease difficulty
+            newDifficulty = Math.max(miner.difficulty * 0.7, 1); // Min difficulty
+        }
+        
+        if (newDifficulty !== miner.difficulty) {
+            console.log(`🎯 Adjusting ${miner.username} difficulty: ${miner.difficulty} → ${newDifficulty} (${actualSharesPerMinute.toFixed(1)} shares/min)`);
+            miner.difficulty = newDifficulty;
+            miner.lastDifficultyAdjust = now;
+            miner.validShares = 0; // Reset counter
+            this.sendDifficulty(miner);
+        }
+    }
+
     handleConnection(socket) {
         const startTime = Date.now();
         const minerId = crypto.randomUUID();
@@ -287,22 +318,12 @@ class RealStratumServer extends EventEmitter {
         
         miner.authorized = true;
         miner.username = username;
-        // Smart difficulty based on hardware detection
-        function getInitialDifficulty(username) {
-            const name = username.toLowerCase();
-            
-            if (name.includes('nano') || name.includes('avalon')) {
-                return 256;  // 6 TH/s Avalon Nano S
-            }
-            if (name.includes('s9')) {
-                return 512;  // 13.5 TH/s S9
-            }
-            
-            // Default for unknown miners
-            return 256;
-        }
-
-        miner.difficulty = getInitialDifficulty(username);
+        
+        // ✅ NEW DYNAMIC DIFFICULTY APPROACH
+        miner.difficulty = 1;  // Start very low, adjust dynamically
+        miner.shareCount = 0;
+        miner.validShares = 0;
+        miner.lastDifficultyAdjust = Date.now();
         
         // Log to database
         this.db.logMinerConnection(miner.id, username, miner.address);
@@ -315,10 +336,10 @@ class RealStratumServer extends EventEmitter {
 
         this.sendMessage(miner.socket, response);
         
-        // Force send new difficulty immediately
+        // Send initial difficulty immediately
         this.sendDifficulty(miner);
         
-        console.log(`Miner authorized: ${username} from ${miner.address} - Set difficulty to ${miner.difficulty}`);
+        console.log(`Miner authorized: ${username} from ${miner.address} - Starting with difficulty ${miner.difficulty} (will adjust dynamically)`);
     }
 
     async handleSubmit(miner, id, params) {
@@ -337,6 +358,8 @@ class RealStratumServer extends EventEmitter {
         
         if (isValid) {
             miner.validShares++;
+            // ✅ ADD DYNAMIC DIFFICULTY ADJUSTMENT HERE
+            this.adjustMinerDifficulty(miner);
         }
         
         const response = {
@@ -354,7 +377,7 @@ class RealStratumServer extends EventEmitter {
             console.log(`❌ Invalid share from ${username} (${miner.validShares}/${miner.shares})`);
         }
     }
-
+        
     async validateShare(miner, jobId, extranonce2, time, nonce) {
         const startTime = Date.now();
         
@@ -812,6 +835,8 @@ class RealStratumServer extends EventEmitter {
         
         // Convert to 32-byte buffer
         const targetHex = target.toString(16).padStart(64, '0');
+        console.log(`🎯 DIFFICULTY DEBUG: diff=${difficulty} → target=${targetHex.substring(0, 16)}...`);
+
         return Buffer.from(targetHex, 'hex');
     }
 
