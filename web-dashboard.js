@@ -173,31 +173,6 @@ class EnhancedDashboard {
         }
     }
 
-    // Enhanced version that uses actual pool difficulty:
-    async calculateExactHashrate(miners, sharesLastHour) {
-        console.log('=== EXACT HASHRATE WITH POOL DIFFICULTY ===');
-        
-        if (sharesLastHour > 0) {
-            const poolDifficulty = await this.getCurrentPoolDifficulty();
-            
-            const HASHES_PER_DIFFICULTY_1_SHARE = 4294967296; // 2^32
-            const HOURS_TO_SECONDS = 3600;
-            
-            // Calculate exact hashes with actual pool difficulty
-            const totalHashes = sharesLastHour * HASHES_PER_DIFFICULTY_1_SHARE * poolDifficulty;
-            const hashesPerSecond = totalHashes / HOURS_TO_SECONDS;
-            const teraHashesPerSecond = hashesPerSecond / 1000000000000;
-            
-            console.log(`Pool difficulty: ${poolDifficulty}`);
-            console.log(`${sharesLastHour} shares × ${HASHES_PER_DIFFICULTY_1_SHARE} × ${poolDifficulty} = ${totalHashes} hashes`);
-            console.log(`Exact hashrate: ${teraHashesPerSecond.toFixed(3)} TH/s`);
-            
-            return teraHashesPerSecond.toFixed(3);
-        }
-        
-        return "0.0";
-    }
-
     async getEnhancedStats() {
         // Get current active miners with detailed info
         const minersResult = await this.pool.query(`
@@ -285,7 +260,7 @@ class EnhancedDashboard {
         const sharesPerMinute = shares.shares_last_hour > 0 ? (shares.shares_last_hour / 60).toFixed(1) : '0.0';
 
         // Calculate estimated hashrate (rough approximation)
-        const estimatedHashrate = await this.calculateExactHashrate(minersResult.rows, shares.shares_last_hour);
+        const estimatedHashrate = this.calculateEstimatedHashrate(minersResult.rows, shares.shares_last_hour);
 
         // Calculate uptime percentage (very rough estimate)
         const uptimePercent = this.calculateUptimePercent(minersResult.rows);
@@ -326,21 +301,16 @@ class EnhancedDashboard {
     }
 
     calculateEstimatedHashrate(miners, sharesLastHour) {
-        console.log('=== FIXED HASHRATE CALCULATION ===');
-        console.log('Shares submitted in last hour:', sharesLastHour);
+        console.log('=== SIMPLE MINER COUNT METHOD ===');
         
-        if (sharesLastHour > 0) {
-            // CORRECTED calculation - avoid large number precision loss
-            const hashesPerSecondPerShare = 4294967296 / 3600; // Pre-calculate this
-            const hashesPerSecond = sharesLastHour * hashesPerSecondPerShare;
-            const teraHashesPerSecond = hashesPerSecond / 1e12;
-            
-            console.log(`CORRECTED MATH:`);
-            console.log(`${sharesLastHour} shares/hour × 4,294,967,296 hashes/share ÷ 3,600 seconds ÷ 1e12`);
-            console.log(`= ${sharesLastHour} × ${hashesPerSecondPerShare.toFixed(0)} ÷ 1e12`);
-            console.log(`= ${teraHashesPerSecond.toFixed(3)} TH/s`);
-            
-            return teraHashesPerSecond.toFixed(1);
+        // Count connected miners from the query
+        const connectedMiners = miners.filter(m => m.is_connected).length;
+        console.log('Connected miners:', connectedMiners);
+        
+        if (connectedMiners > 0) {
+            const hashrate = (connectedMiners * 14).toFixed(1);
+            console.log('Hashrate calculation: ', connectedMiners, '× 14 TH/s =', hashrate, 'TH/s');
+            return hashrate;
         }
         
         return "0.0";
