@@ -219,50 +219,39 @@ class EnhancedDashboard {
             WHERE submitted_at >= CURRENT_DATE
         `);
         
-        // Add this to your web-dashboard.js getEnhancedStats function:
+        const timeWindowStats = await this.pool.query(`
+            SELECT 
+                -- 30 minutes
+                COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '30 minutes' THEN 1 END) as shares_30m,
+                COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '30 minutes' AND is_valid THEN 1 END) as valid_30m,
+                
+                -- 1 hour  
+                COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '1 hour' THEN 1 END) as shares_1h,
+                COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '1 hour' AND is_valid THEN 1 END) as valid_1h,
+                
+                -- 6 hours
+                COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '6 hours' THEN 1 END) as shares_6h,
+                COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '6 hours' AND is_valid THEN 1 END) as valid_6h,
+                
+                -- 12 hours
+                COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '12 hours' THEN 1 END) as shares_12h,
+                COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '12 hours' AND is_valid THEN 1 END) as valid_12h,
+                
+                -- 24 hours
+                COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '24 hours' THEN 1 END) as shares_24h,
+                COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '24 hours' AND is_valid THEN 1 END) as valid_24h
+            FROM shares
+        `);
 
-            const timeWindowStats = await this.pool.query(`
-                SELECT 
-                    -- 30 minutes
-                    COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '30 minutes' THEN 1 END) as shares_30m,
-                    COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '30 minutes' AND is_valid THEN 1 END) as valid_30m,
-                    
-                    -- 1 hour  
-                    COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '1 hour' THEN 1 END) as shares_1h,
-                    COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '1 hour' AND is_valid THEN 1 END) as valid_1h,
-                    
-                    -- 6 hours
-                    COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '6 hours' THEN 1 END) as shares_6h,
-                    COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '6 hours' AND is_valid THEN 1 END) as valid_6h,
-                    
-                    -- 12 hours
-                    COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '12 hours' THEN 1 END) as shares_12h,
-                    COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '12 hours' AND is_valid THEN 1 END) as valid_12h,
-                    
-                    -- 24 hours
-                    COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '24 hours' THEN 1 END) as shares_24h,
-                    COUNT(CASE WHEN submitted_at >= NOW() - INTERVAL '24 hours' AND is_valid THEN 1 END) as valid_24h
-                FROM shares
-            `);
+        const windows = timeWindowStats.rows[0];
 
-            const windows = timeWindowStats.rows[0];
-
-            const efficiencyWindows = {
-                efficiency_30m: windows.shares_30m > 0 ? ((windows.valid_30m / windows.shares_30m) * 100).toFixed(1) : '0.0',
-                efficiency_1h: windows.shares_1h > 0 ? ((windows.valid_1h / windows.shares_1h) * 100).toFixed(1) : '0.0',
-                efficiency_6h: windows.shares_6h > 0 ? ((windows.valid_6h / windows.shares_6h) * 100).toFixed(1) : '0.0',
-                efficiency_12h: windows.shares_12h > 0 ? ((windows.valid_12h / windows.shares_12h) * 100).toFixed(1) : '0.0',
-                efficiency_24h: windows.shares_24h > 0 ? ((windows.valid_24h / windows.shares_24h) * 100).toFixed(1) : '0.0'
-            };
-
-            // Add to your return object:
-            return {
-                // ... existing stats ...
-                timeWindows: {
-                    ...windows,
-                    ...efficiencyWindows
-                }
-            };
+        const efficiencyWindows = {
+            efficiency_30m: windows.shares_30m > 0 ? ((windows.valid_30m / windows.shares_30m) * 100).toFixed(1) : '0.0',
+            efficiency_1h: windows.shares_1h > 0 ? ((windows.valid_1h / windows.shares_1h) * 100).toFixed(1) : '0.0',
+            efficiency_6h: windows.shares_6h > 0 ? ((windows.valid_6h / windows.shares_6h) * 100).toFixed(1) : '0.0',
+            efficiency_12h: windows.shares_12h > 0 ? ((windows.valid_12h / windows.shares_12h) * 100).toFixed(1) : '0.0',
+            efficiency_24h: windows.shares_24h > 0 ? ((windows.valid_24h / windows.shares_24h) * 100).toFixed(1) : '0.0'
+        };
 
         // Get all-time statistics
         const allTimeResult = await this.pool.query(`
@@ -351,21 +340,26 @@ class EnhancedDashboard {
             sharesLastHour: parseInt(shares.shares_last_hour) || 0,
             estimatedHashrate: parseFloat(estimatedHashrate),
             uptimePercent: uptimePercent,
-            rejectionRate: shares.total_shares_today > 0 ? 
+            rejectionRate: shares.total_shares_today > 0 ?
                 ((shares.rejected_shares_today / shares.total_shares_today) * 100).toFixed(1) : '0.0',
             lastShareTime: allTime.last_share_time
         },
-            recentActivity: activityResult.rows,
-            blocksFound: blocksResult.rows,
-            performance: {
-                processingTimeStats: {
-                    avg: parseFloat(shares.avg_processing_time) || 0,
-                    min: parseFloat(shares.min_processing_time) || 0,
-                    max: parseFloat(shares.max_processing_time) || 0,
-                    stddev: parseFloat(shares.stddev_processing_time) || 0
-                }
+        recentActivity: activityResult.rows,
+        blocksFound: blocksResult.rows,
+        performance: {
+            processingTimeStats: {
+                avg: parseFloat(shares.avg_processing_time) || 0,
+                min: parseFloat(shares.min_processing_time) || 0,
+                max: parseFloat(shares.max_processing_time) || 0,
+                stddev: parseFloat(shares.stddev_processing_time) || 0
             }
-        };
+        },
+        // ADD THIS LINE:
+        timeWindows: {
+            ...windows,
+            ...efficiencyWindows
+        }
+    };
     }
 
     calculateEstimatedHashrate(miners, sharesLastHour) {

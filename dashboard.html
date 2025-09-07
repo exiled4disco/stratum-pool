@@ -243,7 +243,41 @@
             font-size: 0.8rem;
             opacity: 0.8;
         }
-        
+        .time-windows-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+            margin-top: 15px;
+        }
+
+        .time-window {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
+            padding: 15px;
+            text-align: center;
+        }
+
+        .window-label {
+            font-size: 0.9rem;
+            margin-bottom: 8px;
+            color: #f7931a;
+        }
+
+        .window-efficiency {
+            font-size: 1.8rem;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+
+        .window-shares {
+            font-size: 0.8rem;
+            opacity: 0.8;
+        }
+
+        /* Color coding for efficiency */
+        .efficiency-excellent { color: #10b981; }  /* 95%+ */
+        .efficiency-good { color: #f59e0b; }       /* 85-95% */
+        .efficiency-poor { color: #ef4444; }       /* <85% */
         @media (max-width: 768px) {
             .charts-container {
                 grid-template-columns: 1fr;
@@ -315,24 +349,34 @@
     </div>
     
     <!-- Performance Metrics -->
+    <!-- Time Window Performance Analysis -->
     <div class="stat-card wide-card">
-        <h3>⚡ Performance Metrics</h3>
-        <div class="performance-grid">
-            <div class="performance-metric">
-                <div class="metric-value" id="avgProcessingTime">0ms</div>
-                <div class="metric-label">Avg Processing</div>
+        <h3>📊 Performance Analysis - Time Windows</h3>
+        <div class="time-windows-grid">
+            <div class="time-window">
+                <div class="window-label">Last 30 Min</div>
+                <div class="window-efficiency" id="efficiency30m">--%</div>
+                <div class="window-shares"><span id="valid30m">0</span>/<span id="total30m">0</span></div>
             </div>
-            <div class="performance-metric">
-                <div class="metric-value" id="sharesPerMinute">0</div>
-                <div class="metric-label">Shares/Min</div>
+            <div class="time-window">
+                <div class="window-label">Last 1 Hour</div>
+                <div class="window-efficiency" id="efficiency1h">--%</div>
+                <div class="window-shares"><span id="valid1h">0</span>/<span id="total1h">0</span></div>
             </div>
-            <div class="performance-metric">
-                <div class="metric-value" id="uptimePercent">0%</div>
-                <div class="metric-label">Uptime (24h)</div>
+            <div class="time-window">
+                <div class="window-label">Last 6 Hours</div>
+                <div class="window-efficiency" id="efficiency6h">--%</div>
+                <div class="window-shares"><span id="valid6h">0</span>/<span id="total6h">0</span></div>
             </div>
-            <div class="performance-metric">
-                <div class="metric-value" id="rejectionRate">0%</div>
-                <div class="metric-label">Rejection Rate</div>
+            <div class="time-window">
+                <div class="window-label">Last 12 Hours</div>
+                <div class="window-efficiency" id="efficiency12h">--%</div>
+                <div class="window-shares"><span id="valid12h">0</span>/<span id="total12h">0</span></div>
+            </div>
+            <div class="time-window">
+                <div class="window-label">Last 24 Hours</div>
+                <div class="window-efficiency" id="efficiency24h">--%</div>
+                <div class="window-shares"><span id="valid24h">0</span>/<span id="total24h">0</span></div>
             </div>
         </div>
     </div>
@@ -701,6 +745,34 @@
         document.addEventListener('DOMContentLoaded', () => {
             new MiningDashboard();
         });
+        // Add this at the end of updateDashboard function:
+        if (data.timeWindows) {
+            const windows = ['30m', '1h', '6h', '12h', '24h'];
+            
+            windows.forEach(window => {
+                const efficiency = parseFloat(data.timeWindows[`efficiency_${window}`]);
+                const efficiencyElement = document.getElementById(`efficiency${window}`);
+                
+                if (efficiencyElement) {
+                    efficiencyElement.textContent = efficiency.toFixed(1) + '%';
+                    
+                    // Color coding
+                    if (efficiency >= 95) {
+                        efficiencyElement.className = 'window-efficiency efficiency-excellent';
+                    } else if (efficiency >= 85) {
+                        efficiencyElement.className = 'window-efficiency efficiency-good';
+                    } else {
+                        efficiencyElement.className = 'window-efficiency efficiency-poor';
+                    }
+                }
+                
+                const validElement = document.getElementById(`valid${window}`);
+                const totalElement = document.getElementById(`total${window}`);
+                
+                if (validElement) validElement.textContent = data.timeWindows[`valid_${window}`];
+                if (totalElement) totalElement.textContent = data.timeWindows[`shares_${window}`];
+            });
+        }
     </script>
 </body>
 </html>
