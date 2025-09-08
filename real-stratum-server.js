@@ -174,6 +174,7 @@ class RealStratumServer extends EventEmitter {
         const targetHex = targetBig.toString(16).padStart(64, '0');
         console.log(`🔧 Computed target: ${targetHex}`);
         
+
         return Buffer.from(targetHex, 'hex');
     }
 
@@ -381,7 +382,7 @@ class RealStratumServer extends EventEmitter {
         miner.subscriptionId = subscriptionId;
         miner.extranonce1 = crypto.randomBytes(extranonce1Size).toString('hex');
         miner.extranonce2Size = extranonce2Size; // Store for validation
-        miner.difficulty = 0.00001; // Temporary for testing S9 (~14 TH/s, ~400 shares/s, ~12 valid/s)
+        miner.difficulty = 1.0; // Temporary for testing S9 (~14 TH/s, ~400 shares/s, ~12 valid/s)
         miner.shareCount = 0;
         miner.validShares = 0;
         miner.lastDifficultyAdjust = Date.now();
@@ -504,10 +505,10 @@ class RealStratumServer extends EventEmitter {
             return;
         }
 
-        // Log for debugging (remove after confirmation)
+        // Log for debugging
         console.log(`DEBUG Share: worker=${workerName}, jobId=${jobId}, extranonce2=${extranonce2}, ntime=${ntime}, nonce=${nonce}, rolledVersion=${rolledVersion || 'none'}`);
 
-        // Build full coinbase correctly: replace spaces in coinb1/coinb2
+        // ===== BUILD COINBASE CORRECTLY (this part is already correct) =====
         const coinb1_bytes = Buffer.from(this.currentJob.coinb1, 'hex');
         const coinb2_bytes = Buffer.from(this.currentJob.coinb2, 'hex');
 
@@ -529,11 +530,19 @@ class RealStratumServer extends EventEmitter {
             coinb2_suffix
         ]);
 
+        console.log(`🔍 COINBASE PARTS DEBUG:`);
+        console.log(`  coinb1_prefix: ${coinb1_prefix.toString('hex')} (${coinb1_prefix.length} bytes)`);
+        console.log(`  extranonce1: ${extranonce1_bytes.toString('hex')} (${extranonce1_bytes.length} bytes)`);
+        console.log(`  extranonce2: ${extranonce2_bytes.toString('hex')} (${extranonce2_bytes.length} bytes)`);
+        console.log(`  coinb2_suffix: ${coinb2_suffix.toString('hex')} (${coinb2_suffix.length} bytes)`);
+        console.log(`  FINAL coinbase: ${coinbase.toString('hex')}`);
+        console.log(`DEBUG Coinbase (${coinbase.length} bytes): ${coinbase.toString('hex')}`);
+
         const coinbaseHash = this.doublesha256(coinbase); // LE bytes
         const merkleRoot = this.calculateCorrectMerkleRoot(coinbaseHash.reverse().toString('hex'), this.currentJob.merkleSteps || []); // BE hex for merkle
 
-        // Build header with rolled version
-        const header = this.buildOptimizedBlockHeader(this.currentJob, miner, extranonce2, ntime, nonce, rolledVersion);
+        // ===== USE A SIMPLER HEADER BUILDER =====
+        const header = this.buildSimpleBlockHeader(this.currentJob, miner, merkleRoot, ntime, nonce, rolledVersion);
         console.log(`DEBUG Full header hex: ${header.toString('hex')}`);
 
         // Calculate hash only once
@@ -545,13 +554,12 @@ class RealStratumServer extends EventEmitter {
 
         // Check difficulties
         const target = this.difficultyToTarget(miner.difficulty); // BE bytes
-        const meetsPoolDiff = this.meetsTarget(blockHash, target); // Compares reversed (BE hash) <= BE target
+        const meetsPoolDiff = this.meetsTarget(blockHash, target);
         const meetsNetworkDiff = this.meetsTarget(blockHash, Buffer.from(this.currentJob.target, 'hex'));
 
-        // Log validation for debugging (remove after confirmation)
-        const beHash = blockHash.reverse().toString('hex');
-        const beTarget = target.toString('hex');
-        console.log(`DEBUG Validation: coinbase_len=${coinbase.length}, merkle=${merkleRoot.substring(0, 16)}..., hash=${blockHash.reverse().toString('hex').substring(0, 16)}..., target=${target.toString('hex').substring(0, 16)}..., meetsPool=${meetsPoolDiff}, meetsNetwork=${meetsNetworkDiff}`);
+        // Enhanced logging
+        console.log(`🎯 Pool difficulty ${miner.difficulty}: ${meetsPoolDiff ? '✅ VALID' : '❌ INVALID'}`);
+        console.log(`🎯 Network difficulty: ${meetsNetworkDiff ? '✅ BLOCK FOUND!' : '❌ NO BLOCK'}`);
 
         // Queue for batch processing
         this.shareQueue.push({
@@ -614,47 +622,7 @@ class RealStratumServer extends EventEmitter {
         this.monitor.recordMinerDisconnection(minerId);
     }
 
-    buildOptimizedBlockHeader(job, miner, extranonce2, time, nonce, rolledVersion = null) {
-        // Build coinbase transaction first
-        const coinb1Buffer = Buffer.from(job.coinb1, 'hex');
-        const extranonce1Buffer = Buffer.from(miner.extranonce1, 'hex');
-        const extranonce2Buffer = Buffer.from(extranonce2, 'hex');
-        const coinb2Buffer = Buffer.from(job.coinb2, 'hex');
-        
-        // Reconstruct full coinbase transaction
-        const coinbase = Buffer.concat([
-            coinb1Buffer,
-            extranonce1Buffer,
-            extranonce2Buffer,
-            coinb2Buffer
-        ]);
-        
-        console.log(`DEBUG Coinbase: ${coinbase.toString('hex')}`);
-        
-        // Calculate coinbase hash (double SHA256)
-        const coinbaseHash = this.doublesha256(coinbase);
-        console.log(`DEBUG Coinbase hash LE: ${coinbaseHash.toString('hex')}`);
-        console.log(`DEBUG Coinbase hash BE: ${coinbaseHash.reverse().toString('hex')}`);
-        
-        // Calculate merkle root from coinbase hash and merkle steps
-        const merkleSteps = job.merkleSteps || [];
-        let currentHash = coinbaseHash.reverse(); // Back to LE for merkle calculation
-        
-        console.log(`DEBUG Starting merkle calculation with coinbase: ${currentHash.toString('hex')}`);
-        console.log(`DEBUG Merkle steps: ${JSON.stringify(merkleSteps)}`);
-        
-        // Apply merkle steps
-        for (let i = 0; i < merkleSteps.length; i++) {
-            const stepHash = Buffer.from(merkleSteps[i], 'hex').reverse(); // Convert to LE
-            const combined = Buffer.concat([currentHash, stepHash]);
-            currentHash = this.doublesha256(combined);
-            console.log(`DEBUG Merkle step ${i}: combined ${combined.toString('hex')} -> ${currentHash.toString('hex')}`);
-        }
-        
-        const finalMerkleRoot = currentHash;
-        console.log(`DEBUG Final merkle root LE: ${finalMerkleRoot.toString('hex')}`);
-        console.log(`DEBUG Final merkle root BE: ${finalMerkleRoot.reverse().toString('hex')}`);
-        
+    buildSimpleBlockHeader(job, miner, merkleRootHex, time, nonce, rolledVersion = null) {
         // Handle version rolling
         let version;
         if (miner.supportsVersionRolling && rolledVersion) {
@@ -676,13 +644,12 @@ class RealStratumServer extends EventEmitter {
         offset += 4;
         
         // Previous block hash (32 bytes, little-endian)
-        // Bitcoin Core returns prevhash in little-endian format
         const prevHashBuffer = Buffer.from(job.prevHash, 'hex');
         prevHashBuffer.copy(header, offset);
         offset += 32;
         
         // Merkle root (32 bytes, little-endian)
-        finalMerkleRoot.reverse().copy(header, offset); // Convert back to LE for header
+        Buffer.from(merkleRootHex, 'hex').reverse().copy(header, offset);
         offset += 32;
         
         // Timestamp (4 bytes, little-endian)
@@ -696,8 +663,7 @@ class RealStratumServer extends EventEmitter {
         // Nonce (4 bytes, little-endian)
         header.writeUInt32LE(parseInt(nonce, 16), offset);
         
-        console.log(`DEBUG Complete header: ${header.toString('hex')}`);
-        console.log(`DEBUG Header fields: version=${version.toString(16)}, prevHash=${job.prevHash.substring(0, 16)}..., merkle=${finalMerkleRoot.toString('hex').substring(0, 16)}..., time=${parseInt(time, 16).toString(16)}, nbits=${job.nbits}, nonce=${parseInt(nonce, 16).toString(16)}`);
+        console.log(`DEBUG Header fields: version=${version.toString(16)}, prevHash=${job.prevHash.substring(0, 16)}..., merkle=${merkleRootHex.substring(0, 16)}..., time=${parseInt(time, 16).toString(16)}, nbits=${job.nbits}, nonce=${parseInt(nonce, 16).toString(16)}`);
         
         return header;
     }
