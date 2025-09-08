@@ -375,15 +375,17 @@ class RealStratumServer extends EventEmitter {
     handleSubscribe(miner, id, params) {
         const subscriptionId = crypto.randomBytes(4).toString('hex');
         const extranonce1 = crypto.randomBytes(4).toString('hex');
-        
+        const extranonce2Size = 4; // Bytes, matches your config (4B = 8 hex chars)
+
         miner.subscribed = true;
         miner.subscriptionId = subscriptionId;
         miner.extranonce1 = extranonce1;
-        miner.difficulty = 0.001; // Initial difficulty for S9 (~1 valid every ~40s)
+        miner.extranonce2Size = extranonce2Size; // Store for validation
+        miner.difficulty = 0.001; // Initial difficulty for S9 (~1 valid every ~111 ms at 13 TH/s)
         miner.shareCount = 0;
         miner.validShares = 0;
         miner.lastDifficultyAdjust = Date.now();
-        
+
         const response = {
             id: id,
             result: [
@@ -391,19 +393,17 @@ class RealStratumServer extends EventEmitter {
                     ["mining.set_difficulty", subscriptionId],
                     ["mining.notify", subscriptionId]
                 ],
-                extranonce1,
-                0 // No miner-side extranonce2
+                extranonce1, // 4 bytes = 8 hex
+                extranonce2Size // 4 bytes for miner-generated extranonce2
             ],
             error: null
         };
-
         this.sendMessage(miner.socket, response);
         this.sendDifficulty(miner);
-        
+
         if (this.currentJob) {
             this.sendJob(miner);
         }
-
         // Periodic job refresh to prevent timeout
         setInterval(() => {
             if (miner.subscribed && miner.authorized && this.currentJob && miner.socket.writable && !miner.socket.destroyed) {
@@ -411,8 +411,7 @@ class RealStratumServer extends EventEmitter {
                 console.log(`🔄 Sent job refresh to ${miner.address}`);
             }
         }, 30000);
-
-        console.log(`✅ Miner subscribed: ${miner.address} (difficulty: ${miner.difficulty})`);
+        console.log(`✅ Miner subscribed: ${miner.address} (extranonce1: ${extranonce1}, extranonce2_size: ${extranonce2Size}, difficulty: ${miner.difficulty})`);
     }
 
     handleAuthorize(miner, id, params) {
@@ -718,37 +717,44 @@ class RealStratumServer extends EventEmitter {
         ]);
         
         const coinbaseHash = this.doublesha256(coinbase);
-        const merkleRoot = this.calculateCorrectMerkleRoot([coinbaseHash.toString('hex'), ...job.merkleSteps]);
+        const merkleRoot = this.calculateCorrectMerkleRoot(coinbaseHash.toString('hex'), job.merkleSteps || []);
+        console.log(`DEBUG Merkle: coinbaseHash=${coinbaseHash.toString('hex').substring(0, 16)}..., root=${merkleRoot.substring(0, 16)}...`);
         
         const header = Buffer.alloc(80);
         let offset = 0;
         
-        // Version: Use rolled version if provided, else job default
-        const version = versionRolled ? (parseInt(this.currentJob.version, 16) | (parseInt(versionRolled, 16) & parseInt(miner.rollingMask, 16))) : parseInt(this.currentJob.version, 16);
+        // Version: LE, apply version rolling
+        const version = versionRolled ? (parseInt(job.version, 16) | (parseInt(versionRolled, 16) & parseInt(miner.rollingMask, 16))) : parseInt(job.version, 16);
         header.writeUInt32LE(version, offset);
+        console.log(`DEBUG Header: version=0x${version.toString(16).padStart(8, '0')} (LE)`);
         offset += 4;
         
-        // Previous block hash
-        Buffer.from(job.prevHash, 'hex').copy(header, offset);
+        // Prev block hash: LE bytes (job.prevHash is already reversed hex)
+        const prevHashBuf = Buffer.from(job.prevHash, 'hex');
+        prevHashBuf.copy(header, offset);
+        console.log(`DEBUG Header: prevHash=${job.prevHash.substring(0, 16)}... (LE)`);
         offset += 32;
         
-        // Merkle root
+        // Merkle root: LE bytes (root is BE hex, reverse for header)
         Buffer.from(merkleRoot, 'hex').reverse().copy(header, offset);
+        console.log(`DEBUG Header: merkleRoot=${merkleRoot.substring(0, 16)}... (BE, reversed to LE)`);
         offset += 32;
         
-        // Timestamp
+        // Timestamp: LE
         header.writeUInt32LE(parseInt(time, 16), offset);
+        console.log(`DEBUG Header: time=0x${time} (LE)`);
         offset += 4;
         
-        // Difficulty bits
+        // Difficulty bits: LE
         header.writeUInt32LE(parseInt(job.nbits, 16), offset);
+        console.log(`DEBUG Header: nbits=${job.nbits} (LE)`);
         offset += 4;
         
-        // Nonce
+        // Nonce: LE
         header.writeUInt32LE(parseInt(nonce, 16), offset);
+        console.log(`DEBUG Header: nonce=0x${nonce} (LE)`);
         
-        // Debug: Log the constructed header
-        console.log(`🔧 Constructed block header: ${header.toString('hex')}`);
+        console.log(`DEBUG Constructed header: ${header.toString('hex').substring(0, 80)}...`);
         return header;
     }
 
@@ -763,30 +769,21 @@ class RealStratumServer extends EventEmitter {
         return hash2;
     }
 
-    calculateCorrectMerkleRoot(hashes) {
-        if (hashes.length === 0) return '0'.repeat(64);
-        if (hashes.length === 1) return hashes[0];
-        
-        let level = hashes.slice();
-        
-        while (level.length > 1) {
-            const nextLevel = [];
-            
-            for (let i = 0; i < level.length; i += 2) {
-                const left = Buffer.from(level[i], 'hex').reverse();
-                const right = level[i + 1] ? 
-                    Buffer.from(level[i + 1], 'hex').reverse() : 
-                    Buffer.from(level[i], 'hex').reverse();
-                
-                const combined = Buffer.concat([left, right]);
-                const hash = this.doublesha256(combined);
-                nextLevel.push(hash.reverse().toString('hex'));
-            }
-            
-            level = nextLevel;
+    calculateCorrectMerkleRoot(coinbaseHashHex, merkleSteps) {
+        if (!merkleSteps || merkleSteps.length === 0) {
+            console.log(`DEBUG Merkle: No steps, using coinbaseHash=${coinbaseHashHex.substring(0, 16)}...`);
+            return coinbaseHashHex;
         }
-        
-        return level[0];
+        let root = coinbaseHashHex;
+        for (let i = 0; i < merkleSteps.length; i++) {
+            const left = Buffer.from(root, 'hex').reverse(); // LE for hashing
+            const right = Buffer.from(merkleSteps[i], 'hex').reverse(); // LE
+            const combined = Buffer.concat([left, right]);
+            const hash = this.doublesha256(combined);
+            root = hash.reverse().toString('hex'); // BE hex for Stratum
+            console.log(`DEBUG Merkle step ${i}: left=${left.toString('hex').substring(0, 16)}..., right=${right.toString('hex').substring(0, 16)}..., root=${root.substring(0, 16)}...`);
+        }
+        return root;
     }
 
     startBatchProcessor() {

@@ -75,6 +75,30 @@ class RealStratumServer extends EventEmitter {
         });
     }
 
+    async testBlockConstruction(miner) {
+        try {
+            if (!this.currentJob || !miner.extranonce1) {
+                console.error('❌ Test failed: No current job or miner extranonce1');
+                return;
+            }
+            const jobId = this.currentJob.jobId;
+            const extranonce2 = '00000000'; // Match 4-byte size
+            const time = this.currentJob.ntime;
+            const nonce = '00000000';
+            const versionRolled = '20000000';
+            const blockHeader = this.buildOptimizedBlockHeader(miner, extranonce2, time, nonce, versionRolled);
+            console.log(`DEBUG Test header: ${blockHeader.toString('hex')}`);
+            const coinbaseTx = this.reconstructCoinbase(miner, extranonce2);
+            console.log(`DEBUG Test coinbase: ${coinbaseTx}`);
+            const blockHex = this.buildFullBlock(blockHeader, miner, extranonce2);
+            console.log(`DEBUG Test block hex (first 200 chars): ${blockHex ? blockHex.substring(0, 200) : 'null'}...`);
+            const result = await this.bitcoin.callRpc('submitblock', [blockHex]);
+            console.log(`DEBUG Test submitblock result: ${JSON.stringify(result)}`);
+        } catch (error) {
+            console.error('❌ Test block construction failed:', error.message);
+        }
+    }
+
     async getNetworkTarget() {
         const now = Date.now();
         
@@ -858,7 +882,6 @@ class RealStratumServer extends EventEmitter {
 
     sendJob(miner) {
         if (!this.currentJob || !miner.subscribed) return;
-
         const message = {
             id: null,
             method: 'mining.notify',
@@ -867,7 +890,7 @@ class RealStratumServer extends EventEmitter {
                 this.currentJob.prevHash,
                 this.currentJob.coinb1,
                 this.currentJob.coinb2,
-                this.currentJob.merkleSteps,
+                this.currentJob.merkleSteps || [], // Fallback to empty array
                 this.currentJob.version,
                 this.currentJob.nbits,
                 this.currentJob.ntime,
@@ -952,6 +975,8 @@ server.start().then(success => {
         console.error('Failed to start server');
         process.exit(1);
     }
+    const dummyMiner = { id: 'test', extranonce1: '12345678', username: 'test' };
+    server.testBlockConstruction(dummyMiner);
 });
 
 // Display stats every 60 seconds
