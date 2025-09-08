@@ -146,24 +146,23 @@ class RealStratumServer extends EventEmitter {
             difficulty = 0.00001;
         }
         
-        // Bitcoin's maximum target (difficulty 1) - exact value from Bitcoin Core
+        // Bitcoin's maximum target for difficulty 1
         const maxTarget = BigInt('0x00000000FFFF0000000000000000000000000000000000000000000000000000');
         
         let targetBig;
         
         if (difficulty >= 1.0) {
             // For difficulty >= 1: target = maxTarget / difficulty
-            // Use floor to match Bitcoin Core behavior
-            const difficultyFloor = BigInt(Math.floor(difficulty));
-            targetBig = maxTarget / difficultyFloor;
+            const difficultyBig = BigInt(Math.floor(difficulty * 1000000)) / BigInt(1000000);
+            targetBig = maxTarget / difficultyBig;
         } else {
-            // For difficulty < 1: target = maxTarget / difficulty (result will be larger than maxTarget)
-            // Use precise calculation with scaling to avoid floating point errors
+            // For difficulty < 1: target = maxTarget / difficulty (makes target LARGER, easier)
+            // Scale up for precision
             const scale = BigInt(1000000000); // 1 billion for precision
             const difficultyScaled = BigInt(Math.round(difficulty * Number(scale)));
             targetBig = (maxTarget * scale) / difficultyScaled;
             
-            // Ensure we don't exceed maximum 256-bit value
+            // Cap at max 256-bit value
             const maxUint256 = (BigInt(1) << BigInt(256)) - BigInt(1);
             if (targetBig > maxUint256) {
                 targetBig = maxUint256;
@@ -172,9 +171,8 @@ class RealStratumServer extends EventEmitter {
         
         // Convert to 32-byte buffer (big-endian)
         const targetHex = targetBig.toString(16).padStart(64, '0');
-        console.log(`🔧 Computed target: ${targetHex}`);
+        console.log(`🔧 Difficulty ${difficulty} -> Target: ${targetHex.substring(0, 16)}...`);
         
-
         return Buffer.from(targetHex, 'hex');
     }
 
@@ -182,20 +180,18 @@ class RealStratumServer extends EventEmitter {
      * Check if hash meets target difficulty (proper endianness handling)
      */
     meetsTarget(hash, target) {
-        // Hash comes in as little-endian bytes from SHA256
-        // Target is stored as big-endian bytes
-        // For comparison, we need both in the same endianness
-        
-        // Convert little-endian hash to big-endian for comparison
+        // Hash comes as little-endian bytes from SHA256
+        // Target is big-endian bytes
+        // Convert hash to big-endian for comparison
         const hashBE = Buffer.from(hash).reverse();
         
-        // Target is already big-endian, so compare directly
+        // Compare as big-endian
         const result = hashBE.compare(target) <= 0;
         
         if (result) {
-            console.log(`✅ Valid share: hash ${hashBE.toString('hex').substring(0, 16)}... <= target ${target.toString('hex').substring(0, 16)}...`);
+            console.log(`✅ VALID: hash ${hashBE.toString('hex').substring(0, 16)}... <= target ${target.toString('hex').substring(0, 16)}...`);
         } else {
-            console.log(`❌ Invalid share: hash ${hashBE.toString('hex').substring(0, 16)}... > target ${target.toString('hex').substring(0, 16)}...`);
+            console.log(`❌ INVALID: hash ${hashBE.toString('hex').substring(0, 16)}... > target ${target.toString('hex').substring(0, 16)}...`);
         }
         
         return result;
@@ -382,7 +378,7 @@ class RealStratumServer extends EventEmitter {
         miner.subscriptionId = subscriptionId;
         miner.extranonce1 = crypto.randomBytes(extranonce1Size).toString('hex');
         miner.extranonce2Size = extranonce2Size; // Store for validation
-        miner.difficulty = 1.0; // Temporary for testing S9 (~14 TH/s, ~400 shares/s, ~12 valid/s)
+        miner.difficulty = 0.0001; // Temporary for testing S9 (~14 TH/s, ~400 shares/s, ~12 valid/s)
         miner.shareCount = 0;
         miner.validShares = 0;
         miner.lastDifficultyAdjust = Date.now();
@@ -568,9 +564,13 @@ class RealStratumServer extends EventEmitter {
         const processingTime = Date.now() - startTime;
 
         // Check difficulties
-        const target = this.difficultyToTarget(miner.difficulty); // BE bytes
+        const target = this.difficultyToTarget(miner.difficulty);
+        const networkTarget = this.difficultyToTarget(await this.getNetworkTarget() || 73000000000000);
         const meetsPoolDiff = this.meetsTarget(blockHash, target);
-        const meetsNetworkDiff = this.meetsTarget(blockHash, Buffer.from(this.currentJob.target, 'hex'));
+        const meetsNetworkDiff = this.meetsTarget(blockHash, networkTarget);
+
+        console.log(`🎯 Pool difficulty ${miner.difficulty}: ${meetsPoolDiff ? '✅ VALID' : '❌ INVALID'}`);
+        console.log(`🎯 Network difficulty: ${meetsNetworkDiff ? '✅ BLOCK FOUND!' : '❌ NO BLOCK'}`);
 
         // Enhanced logging
         console.log(`🎯 Pool difficulty ${miner.difficulty}: ${meetsPoolDiff ? '✅ VALID' : '❌ INVALID'}`);
