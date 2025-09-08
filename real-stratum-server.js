@@ -533,7 +533,7 @@ class RealStratumServer extends EventEmitter {
         const merkleRoot = this.calculateCorrectMerkleRoot(coinbaseHash.reverse().toString('hex'), this.currentJob.merkleSteps || []); // BE hex for merkle
 
         // Build header with rolled version
-        const header = this.buildOptimizedBlockHeader(this.currentJob, miner, merkleRoot, ntime, nonce, rolledVersion);
+        const header = this.buildOptimizedBlockHeader(this.currentJob, miner, extranonce2, ntime, nonce, rolledVersion);
         console.log(`DEBUG Full header hex: ${header.toString('hex')}`);
 
         // Calculate hash only once
@@ -614,48 +614,90 @@ class RealStratumServer extends EventEmitter {
         this.monitor.recordMinerDisconnection(minerId);
     }
 
-    buildOptimizedBlockHeader(job, miner, merkleRoot, time, nonce, rolledVersion = null) {
-        // Use submitted rolled version if provided (version-rolling)
+    buildOptimizedBlockHeader(job, miner, extranonce2, time, nonce, rolledVersion = null) {
+        // Build coinbase transaction first
+        const coinb1Buffer = Buffer.from(job.coinb1, 'hex');
+        const extranonce1Buffer = Buffer.from(miner.extranonce1, 'hex');
+        const extranonce2Buffer = Buffer.from(extranonce2, 'hex');
+        const coinb2Buffer = Buffer.from(job.coinb2, 'hex');
+        
+        // Reconstruct full coinbase transaction
+        const coinbase = Buffer.concat([
+            coinb1Buffer,
+            extranonce1Buffer,
+            extranonce2Buffer,
+            coinb2Buffer
+        ]);
+        
+        console.log(`DEBUG Coinbase: ${coinbase.toString('hex')}`);
+        
+        // Calculate coinbase hash (double SHA256)
+        const coinbaseHash = this.doublesha256(coinbase);
+        console.log(`DEBUG Coinbase hash LE: ${coinbaseHash.toString('hex')}`);
+        console.log(`DEBUG Coinbase hash BE: ${coinbaseHash.reverse().toString('hex')}`);
+        
+        // Calculate merkle root from coinbase hash and merkle steps
+        const merkleSteps = job.merkleSteps || [];
+        let currentHash = coinbaseHash.reverse(); // Back to LE for merkle calculation
+        
+        console.log(`DEBUG Starting merkle calculation with coinbase: ${currentHash.toString('hex')}`);
+        console.log(`DEBUG Merkle steps: ${JSON.stringify(merkleSteps)}`);
+        
+        // Apply merkle steps
+        for (let i = 0; i < merkleSteps.length; i++) {
+            const stepHash = Buffer.from(merkleSteps[i], 'hex').reverse(); // Convert to LE
+            const combined = Buffer.concat([currentHash, stepHash]);
+            currentHash = this.doublesha256(combined);
+            console.log(`DEBUG Merkle step ${i}: combined ${combined.toString('hex')} -> ${currentHash.toString('hex')}`);
+        }
+        
+        const finalMerkleRoot = currentHash;
+        console.log(`DEBUG Final merkle root LE: ${finalMerkleRoot.toString('hex')}`);
+        console.log(`DEBUG Final merkle root BE: ${finalMerkleRoot.reverse().toString('hex')}`);
+        
+        // Handle version rolling
         let version;
         if (miner.supportsVersionRolling && rolledVersion) {
             const baseVersion = parseInt(job.version, 16);
             const rolledBits = parseInt(rolledVersion, 16);
-            version = baseVersion | (rolledBits & parseInt(miner.rollingMask, 16));
+            const mask = parseInt(miner.rollingMask || '1fffe000', 16);
+            version = baseVersion | (rolledBits & mask);
             console.log(`DEBUG Version rolling: base=${baseVersion.toString(16)}, rolled=${rolledVersion}, mask=${miner.rollingMask}, final=${version.toString(16)}`);
         } else {
             version = parseInt(job.version, 16);
         }
-
+        
+        // Build 80-byte block header
         const header = Buffer.alloc(80);
         let offset = 0;
         
-        // Version: LE (4 bytes)
+        // Version (4 bytes, little-endian)
         header.writeUInt32LE(version, offset);
         offset += 4;
         
-        // Previous block hash: LE (32 bytes) 
-        // job.prevHash is already in LE format from getBlockTemplate
-        const prevHashBuf = Buffer.from(job.prevHash, 'hex');
-        prevHashBuf.copy(header, offset);
+        // Previous block hash (32 bytes, little-endian)
+        // Bitcoin Core returns prevhash in little-endian format
+        const prevHashBuffer = Buffer.from(job.prevHash, 'hex');
+        prevHashBuffer.copy(header, offset);
         offset += 32;
         
-        // Merkle root: LE (32 bytes)
-        // Convert merkleRoot from BE hex to LE bytes
-        Buffer.from(merkleRoot, 'hex').reverse().copy(header, offset);
+        // Merkle root (32 bytes, little-endian)
+        finalMerkleRoot.reverse().copy(header, offset); // Convert back to LE for header
         offset += 32;
         
-        // Timestamp: LE (4 bytes)
+        // Timestamp (4 bytes, little-endian)
         header.writeUInt32LE(parseInt(time, 16), offset);
         offset += 4;
         
-        // Difficulty bits: LE (4 bytes)  
+        // Difficulty bits (4 bytes, little-endian)
         header.writeUInt32LE(parseInt(job.nbits, 16), offset);
         offset += 4;
         
-        // Nonce: LE (4 bytes)
+        // Nonce (4 bytes, little-endian)
         header.writeUInt32LE(parseInt(nonce, 16), offset);
         
-        console.log(`DEBUG Header built: version=${version.toString(16)}, prevHash=${job.prevHash.substring(0, 16)}..., merkle=${merkleRoot.substring(0, 16)}..., ntime=${parseInt(time, 16).toString(16)}, nbits=${job.nbits}, nonce=${parseInt(nonce, 16).toString(16)}`);
+        console.log(`DEBUG Complete header: ${header.toString('hex')}`);
+        console.log(`DEBUG Header fields: version=${version.toString(16)}, prevHash=${job.prevHash.substring(0, 16)}..., merkle=${finalMerkleRoot.toString('hex').substring(0, 16)}..., time=${parseInt(time, 16).toString(16)}, nbits=${job.nbits}, nonce=${parseInt(nonce, 16).toString(16)}`);
         
         return header;
     }
