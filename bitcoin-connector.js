@@ -97,82 +97,83 @@ class BitcoinConnector extends EventEmitter {
         }
     }
 
-    createCoinbaseParts(template) {
-        const height = template.height;
-        const coinbaseValue = template.coinbasevalue; // Satoshis
-        const witnessCommitment = template.default_witness_commitment || '';
-        const flags = template.coinbaseaux ? template.coinbaseaux.flags || '' : '';
-
-        // Varint encode for height (compact size)
-        const heightBuffer = this.varintEncode(height);
-
-        // Pool signature buffer
-        const poolSigBuffer = Buffer.from(this.poolSig, 'utf8');
-
-        // Extranonce space: extranonce1_size + extranonce2_size = 8 bytes (placeholder all zero for merkle)
-        const extranonceSpace = Buffer.alloc(this.extranonce1Size + this.extranonce2Size, 0);
-
-        // ScriptSig content: height + flags + poolSig + extranonce space
-        const scriptSigContent = Buffer.concat([heightBuffer, Buffer.from(flags, 'hex'), poolSigBuffer, extranonceSpace]);
-
-        // Varint for scriptSig length
-        const scriptSigLen = this.varintEncode(scriptSigContent.length);
-
-        // coinb1: version (20000000 LE) + input count (01) + prevout hash (32 zero) + vout (ffffffff) + scriptSig len + scriptSig content up to extranonce space
-        const coinb1Parts = [
-            Buffer.from('01000000', 'hex'), // Version 1 (LE)
-            Buffer.from('01', 'hex'), // Input count: 1
-            Buffer.alloc(32, 0), // Prevout hash: all zero
-            Buffer.from('ffffffff', 'hex'), // Prevout index
-            scriptSigLen,
-            heightBuffer,
-            Buffer.from(flags, 'hex'),
-            poolSigBuffer,
-            Buffer.alloc(this.extranonce1Size, 0) // Space for extranonce1 only (extranonce2 in coinb2 space)
-        ];
-        const coinb1 = Buffer.concat(coinb1Parts).toString('hex');
-
-        // Pool address scriptPubKey (P2PKH for 1GWVQpX8bnwkQsLYHrdzQqma7vWXbp9zFH: hash160 = e1ffffd5dc4e292f1a93e400be0b5e7a3d4b0b3b)
-        const poolHash160 = Buffer.from('e1ffffd5dc4e292f1a93e400be0b5e7a3d4b0b3b', 'hex');
-        const scriptPubKey = Buffer.concat([
+    createScriptPubKey(address) {
+        // For P2PKH address like yours: 1GWVQpX8bnwkQsLYHrdzQqma7vWXbp9zFH
+        // Extract hash160 from address (this is a simplified version)
+        const hash160 = Buffer.from('e1ffffd5dc4e292f1a93e400be0b5e7a3d4b0b3b', 'hex');
+        
+        return Buffer.concat([
             Buffer.from('76a914', 'hex'), // OP_DUP OP_HASH160
-            poolHash160,
+            hash160,
             Buffer.from('88ac', 'hex') // OP_EQUALVERIFY OP_CHECKSIG
         ]);
+    }
 
-        // Coinbase output: value (8B LE) + output count (01) + script len (19 for P2PKH) + scriptPubKey
-        const valueBuffer = this.littleEndian64(coinbaseValue);
-        const outputParts = [
-            valueBuffer,
-            Buffer.from('01', 'hex'), // Output count: 1 (solo, no fees split)
-            Buffer.from([scriptPubKey.length]), // Script len: 25
-            scriptPubKey
+    createCoinbaseParts(template) {
+        const height = template.height;
+        const coinbaseValue = template.coinbasevalue;
+        const witnessCommitment = template.default_witness_commitment || '';
+        
+        // Encode height properly
+        const heightBuffer = this.varintEncode(height);
+        
+        // Build scriptSig: height + extranonce_placeholder + optional data
+        const scriptSigStart = Buffer.concat([
+            heightBuffer,
+            Buffer.from('/solo/', 'utf8') // Pool signature
+        ]);
+        
+        // coinb1: everything up to extranonce1
+        const coinb1Parts = [
+            Buffer.from('01000000', 'hex'), // version
+            Buffer.from('01', 'hex'), // input count
+            Buffer.alloc(32, 0), // prevout hash (all zeros)
+            Buffer.from('ffffffff', 'hex'), // prevout index
+            Buffer.from([scriptSigStart.length + this.extranonce1Size + this.extranonce2Size]), // scriptSig length
+            scriptSigStart
+            // extranonce1 will be inserted here by stratum
         ];
-
-        // Sequence + witness commitment (if present): ffffffff + 6a 24 aa21 + commitment
-        let witnessPart = Buffer.from('ffffffff', 'hex'); // Sequence
-        if (witnessCommitment) {
-            const commitmentScript = Buffer.concat([
-                Buffer.from('6a24aa21', 'hex'), // OP_RETURN + push 34B
-                Buffer.from(witnessCommitment, 'hex')
-            ]);
-            witnessPart = Buffer.concat([witnessPart, Buffer.from([commitmentScript.length]), commitmentScript]);
-        }
-
-        // coinb2: extranonce2 space + output + witness part + locktime (00000000)
+        
+        const coinb1 = Buffer.concat(coinb1Parts).toString('hex');
+        
+        // coinb2: everything after extranonce2
+        const outputValue = Buffer.alloc(8);
+        outputValue.writeBigUInt64LE(BigInt(coinbaseValue), 0);
+        
+        const scriptPubKey = this.createScriptPubKey(this.poolAddress);
+        
         const coinb2Parts = [
-            Buffer.alloc(this.extranonce2Size, 0), // Space for extranonce2
-            ...outputParts,
-            witnessPart,
-            Buffer.from('00000000', 'hex') // Locktime
+            // extranonce2 space handled by stratum
+            Buffer.from('ffffffff', 'hex'), // sequence
+            Buffer.from('01', 'hex'), // output count
+            outputValue, // output value
+            Buffer.from([scriptPubKey.length]), // script length
+            scriptPubKey, // scriptPubKey
+            Buffer.from('00000000', 'hex') // locktime
         ];
+        
+        if (witnessCommitment) {
+            // Add witness commitment output
+            coinb2Parts.splice(-1, 0, 
+                Buffer.from('0000000000000000', 'hex'), // 0 value
+                Buffer.from('26', 'hex'), // script length (38 bytes)
+                Buffer.from('6a24aa21a9ed', 'hex'), // OP_RETURN + commitment prefix
+                Buffer.from(witnessCommitment, 'hex')
+            );
+            coinb2Parts[coinb2Parts.length - 4] = Buffer.from('02', 'hex'); // Update output count to 2
+        }
+        
         const coinb2 = Buffer.concat(coinb2Parts).toString('hex');
-
-        // Full placeholder coinbase for merkle hash (extranonce2=00000000)
-        const fullCoinbase = Buffer.concat([Buffer.from(coinb1, 'hex'), extranonceSpace.slice(this.extranonce1Size), Buffer.from(coinb2, 'hex')]);
-        const coinbaseHash = this.doublesha256(fullCoinbase).reverse().toString('hex');
-
-        console.log(`DEBUG Coinbase construction: coinb1 len=${coinb1.length}, coinb2 len=${coinb2.length}, witness=${witnessCommitment ? 'included' : 'missing'}`);
+        
+        // Create merkle root calculation template
+        const fullCoinbaseTemplate = Buffer.concat([
+            Buffer.from(coinb1, 'hex'),
+            Buffer.alloc(this.extranonce1Size + this.extranonce2Size, 0), // placeholder for merkle calc
+            Buffer.from(coinb2, 'hex')
+        ]);
+        
+        const coinbaseHash = this.doublesha256(fullCoinbaseTemplate).toString('hex');
+        
         return { coinb1, coinb2, coinbaseHash };
     }
 
@@ -211,23 +212,36 @@ class BitcoinConnector extends EventEmitter {
         return hash2;
     }
 
-    getMerkleSteps(transactions) {
-        if (!transactions || transactions.length === 0) return [];
-        let level = transactions.slice();
-        const steps = [];
+    getMerkleSteps(txids) {
+        if (!txids || txids.length <= 1) return [];
+        
+        let level = [...txids]; // Copy array
+        const merkleSteps = [];
+        
         while (level.length > 1) {
             const nextLevel = [];
+            
             for (let i = 0; i < level.length; i += 2) {
-                const left = Buffer.from(level[i], 'hex').reverse();
-                const right = level[i + 1] ? Buffer.from(level[i + 1], 'hex').reverse() : left;
-                const combined = Buffer.concat([left, right]);
-                const hash = this.doublesha256(combined).reverse().toString('hex');
-                nextLevel.push(hash);
-                if (i === 0) steps.push(level[i + 1] || level[i]); // Right sibling for coinbase (first tx)
+                const left = level[i];
+                const right = level[i + 1] || left; // Duplicate if odd
+                
+                // For first pair (coinbase), save the right sibling as merkle step
+                if (i === 0 && level.length > 1) {
+                    merkleSteps.push(right);
+                }
+                
+                // Calculate parent hash
+                const leftBuf = Buffer.from(left, 'hex').reverse();
+                const rightBuf = Buffer.from(right, 'hex').reverse();
+                const combined = Buffer.concat([leftBuf, rightBuf]);
+                const parentHash = this.doublesha256(combined).reverse().toString('hex');
+                nextLevel.push(parentHash);
             }
+            
             level = nextLevel;
         }
-        return steps;
+        
+        return merkleSteps;
     }
 
     reverseHex(hex) {

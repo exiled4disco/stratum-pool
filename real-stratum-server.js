@@ -435,7 +435,7 @@ class RealStratumServer extends EventEmitter {
             console.error(`❌ Invalid username from ${miner.address}: ${username}`);
             this.sendError(miner.socket, id, 21, 'Invalid or missing username');
             miner.socket.destroy();
-            return; // Exit function cleanly
+            return;
         }
 
         try {
@@ -447,25 +447,33 @@ class RealStratumServer extends EventEmitter {
             // Update/insert miner record in database to prevent FK violations
             await this.db.logMinerConnection(miner.id, username, miner.address);
 
-            // Send authorization response
+            // Send authorization response first
             this.sendMessage(miner.socket, {
                 id: id,
-                result: true, // Success for solo mining
+                result: true,
                 error: null
             });
 
             console.log(`✅ Authorized ${miner.address}: username=${username}, minerId=${miner.id.substring(0, 8)}`);
 
-            // Send current job if available
+            // Send job with proper timing to prevent disconnection
             if (this.currentJob) {
+                // Send immediately, then again with delay to ensure delivery
                 this.sendJob(miner);
-                console.log(`📤 Sent job ${this.currentJob.jobId} to ${miner.address}`);
+                setTimeout(() => {
+                    if (miner.authorized && !miner.socket.destroyed) {
+                        this.sendJob(miner);
+                        console.log(`📤 Job resent to ${miner.username} for reliability`);
+                    }
+                }, 200);
+                console.log(`📤 Initial job sent to ${miner.address}`);
             } else {
-                console.warn(`⚠️ No current job available for ${miner.address}`);
+                console.warn(`⚠️ No current job available for ${miner.address} - will send when available`);
             }
 
             // Log to monitoring system
             this.monitor.recordMinerConnection(miner.id, username, miner.address);
+
         } catch (err) {
             console.error(`❌ Error during authorization for ${miner.address}: ${err.message}`);
             this.sendError(miner.socket, id, 20, `Authorization failed: ${err.message}`);
@@ -550,6 +558,13 @@ class RealStratumServer extends EventEmitter {
         console.log(`DEBUG Calculated hash LE: ${blockHash.toString('hex')}`);
         console.log(`DEBUG Calculated hash BE: ${Buffer.from(blockHash).reverse().toString('hex')}`);
 
+        console.log(`🔍 MANUAL HASH VERIFICATION:`);
+        const testHeader = Buffer.from('0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c', 'hex');
+        const testHash = this.doublesha256(testHeader);
+        console.log(`  Test header: ${testHeader.toString('hex')}`);
+        console.log(`  Test hash LE: ${testHash.toString('hex')}`);
+        console.log(`  Test hash BE: ${testHash.reverse().toString('hex')}`);
+
         const processingTime = Date.now() - startTime;
 
         // Check difficulties
@@ -594,7 +609,7 @@ class RealStratumServer extends EventEmitter {
         }
 
         // Adjust difficulty periodically
-        this.adjustMinerDifficulty(miner);
+//        this.adjustMinerDifficulty(miner);
     }
 
     handleDisconnect(minerId) {
@@ -664,7 +679,16 @@ class RealStratumServer extends EventEmitter {
         header.writeUInt32LE(parseInt(nonce, 16), offset);
         
         console.log(`DEBUG Header fields: version=${version.toString(16)}, prevHash=${job.prevHash.substring(0, 16)}..., merkle=${merkleRootHex.substring(0, 16)}..., time=${parseInt(time, 16).toString(16)}, nbits=${job.nbits}, nonce=${parseInt(nonce, 16).toString(16)}`);
-        
+        console.log(`🔍 HEADER CONSTRUCTION DEBUG:`);
+        console.log(`  Version LE: ${version.toString(16).padStart(8, '0')}`);
+        console.log(`  PrevHash: ${job.prevHash}`);
+        console.log(`  MerkleRoot BE: ${merkleRootHex}`);
+        console.log(`  MerkleRoot LE: ${Buffer.from(merkleRootHex, 'hex').reverse().toString('hex')}`);
+        console.log(`  Time: ${parseInt(time, 16)} (${time})`);
+        console.log(`  NBits: ${parseInt(job.nbits, 16)} (${job.nbits})`);
+        console.log(`  Nonce: ${parseInt(nonce, 16)} (${nonce})`);
+        console.log(`  Complete header: ${header.toString('hex')}`);
+
         return header;
     }
 
@@ -802,6 +826,17 @@ class RealStratumServer extends EventEmitter {
                 true // Clean jobs
             ]
         };
+        
+        // Add this debug logging:
+        console.log(`🔍 SENDING JOB TO MINER:`);
+        console.log(`  jobId: ${this.currentJob.jobId}`);
+        console.log(`  prevHash: ${this.currentJob.prevHash}`);
+        console.log(`  coinb1: ${this.currentJob.coinb1}`);
+        console.log(`  coinb2: ${this.currentJob.coinb2}`);
+        console.log(`  version: ${this.currentJob.version}`);
+        console.log(`  nbits: ${this.currentJob.nbits}`);
+        console.log(`  ntime: ${this.currentJob.ntime}`);
+        
         this.sendMessage(miner.socket, message);
     }
 
