@@ -319,8 +319,46 @@ class RealStratumServer extends EventEmitter {
 
         switch (method) {
             case 'mining.subscribe':
-                console.log(`📝 Processing subscribe from ${miner.address}`);
-                this.handleSubscribe(miner, id, params);
+                console.log(`🔄 PROCESSING mining.subscribe from ${miner.address}`);
+                const subscriptionId = crypto.randomBytes(4).toString('hex');
+                const extranonce1 = crypto.randomBytes(4).toString('hex');
+                const extranonce2Size = 4; // Bytes, matches config (4B = 8 hex chars)
+
+                miner.subscribed = true;
+                miner.subscriptionId = subscriptionId;
+                miner.extranonce1 = extranonce1;
+                miner.extranonce2Size = extranonce2Size; // Store for validation
+                miner.difficulty = 0.001; // Initial difficulty for S9 (~1 valid every ~111 ms at 13 TH/s)
+                miner.shareCount = 0;
+                miner.validShares = 0;
+                miner.lastDifficultyAdjust = Date.now();
+
+                const response = {
+                    id: message.id,
+                    result: [
+                        [
+                            ["mining.set_difficulty", subscriptionId],
+                            ["mining.notify", subscriptionId]
+                        ],
+                        extranonce1, // 4 bytes = 8 hex
+                        extranonce2Size // 4 bytes for miner-generated extranonce2
+                    ],
+                    error: null
+                };
+                this.sendMessage(miner.socket, response);
+                this.sendDifficulty(miner);
+
+                if (this.currentJob) {
+                    this.sendJob(miner);
+                }
+                // Periodic job refresh to prevent timeout
+                setInterval(() => {
+                    if (miner.subscribed && miner.authorized && this.currentJob && miner.socket.writable && !miner.socket.destroyed) {
+                        this.sendJob(miner);
+                        console.log(`🔄 Sent job refresh to ${miner.address}`);
+                    }
+                }, 30000);
+                console.log(`✅ Miner subscribed: ${miner.address} (extranonce1: ${extranonce1}, extranonce2_size: ${extranonce2Size}, difficulty: ${miner.difficulty})`);
                 break;
             
             case 'mining.authorize':
@@ -329,8 +367,103 @@ class RealStratumServer extends EventEmitter {
                 break;
             
             case 'mining.submit':
-                console.log(`⛏️ Processing share submit from ${miner.address}`);
-                this.handleSubmit(miner, id, params);
+                console.log(`🔄 PROCESSING mining.submit from ${miner.address}`);
+                const params = message.params;
+                const jobId = params[1];
+                let extranonce2 = params[2];
+                const time = params[3];
+                const nonce = params[4];
+                const versionRolled = params[5] || null;
+
+                console.log(`🔍 Validating share for ${miner.username}: jobId=${jobId}, extranonce2=${extranonce2}, time=${time}, nonce=${nonce}, versionRolled=${versionRolled}`);
+
+                // Temporary fallback for empty extranonce2 (remove after confirming non-empty submits)
+                if (!extranonce2 || extranonce2.length === 0) {
+                    extranonce2 = '00000000'; // 4-byte zero pad
+                    console.warn(`⚠️ Empty extranonce2 from ${miner.username}; using zero pad (remove after subscribe fix)`);
+                }
+                if (extranonce2.length !== miner.extranonce2Size * 2) {
+                    console.error(`❌ Invalid extranonce2 length: ${extranonce2.length} (expected ${miner.extranonce2Size * 2})`);
+                    this.sendError(socket, message.id, 23, `Invalid extranonce2 length: ${extranonce2.length}`);
+                    return;
+                }
+
+                // Verify job exists
+                if (!this.currentJob || this.currentJob.jobId !== jobId) {
+                    console.error(`❌ Invalid jobId ${jobId} from ${miner.username}`);
+                    this.sendError(socket, message.id, 21, 'Invalid job');
+                    return;
+                }
+
+                // Version rolling check
+                if (versionRolled && miner.rollingMask) {
+                    const rolledVersion = parseInt(versionRolled, 16);
+                    const mask = parseInt(miner.rollingMask, 16);
+                    const baseVersion = parseInt(this.currentJob.version, 16);
+                    if ((rolledVersion & mask) !== (rolledVersion & mask)) {
+                        console.warn(`⚠️ Version rolling mismatch: ${versionRolled} (base: ${this.currentJob.version}, mask: ${miner.rollingMask})`);
+                    }
+                }
+
+                // Build and validate block header
+                const blockHeader = this.buildOptimizedBlockHeader(miner, extranonce2, time, nonce, versionRolled);
+                const blockHash = this.calculateBlockHash(blockHeader);
+                const coinbaseTx = this.reconstructCoinbase(miner, extranonce2);
+                const coinbaseHash = this.doublesha256(coinbaseTx);
+                const merkleRoot = this.calculateCorrectMerkleRoot(coinbaseHash.toString('hex'), this.currentJob.merkleSteps || []);
+
+                console.log(`DEBUG Share: job=${jobId}, extranonce2=${extranonce2}, coinbaseHash=${coinbaseHash.toString('hex').substring(0, 16)}..., merkleRoot=${merkleRoot.substring(0, 16)}..., blockHash=${blockHash.toString('hex').substring(0, 16)}...`);
+
+                // Validate share against pool difficulty
+                const target = this.difficultyToTarget(miner.difficulty);
+                const reversedHash = Buffer.from(blockHash).reverse();
+                const meetsPoolDiff = this.meetsTarget(blockHash, target);
+
+                // Validate against network difficulty (for block submission)
+                const networkTarget = this.difficultyToTarget(this.cachedNetworkDifficulty || 73197670707408.73);
+                const meetsNetworkDiff = this.meetsTarget(blockHash, networkTarget);
+
+                console.log(`DEBUG Full reversed hash: ${reversedHash.toString('hex')}`);
+                console.log(`DEBUG Full reversed target: ${target.toString('hex')}`);
+                console.log(`DEBUG: Diff=${miner.difficulty}, Target=${target.toString('hex').substring(0, 16)}..., Hash=${reversedHash.toString('hex').substring(0, 16)}..., Compare=${reversedHash.compare(target)}`);
+
+                // Queue share for batch processing
+                const share = {
+                    minerId: miner.id,
+                    jobId: jobId,
+                    nonce: nonce,
+                    isValid: meetsPoolDiff,
+                    meetsPoolDiff: meetsPoolDiff,
+                    meetsNetworkDiff: meetsNetworkDiff,
+                    blockHash: blockHash.toString('hex'),
+                    processingTime: Date.now() - (miner.lastActivity || Date.now())
+                };
+                this.shareQueue.push(share);
+
+                if (meetsPoolDiff) {
+                    miner.validShares++;
+                    console.log(`💎 Valid share: ${miner.username} found nonce ${nonce}`);
+                    this.emit('validShare', { miner, nonce, jobId });
+                    this.adjustMinerDifficulty(miner);
+                } else {
+                    console.log(`🔍 Share validation result: Invalid`);
+                }
+
+                this.sendMessage(socket, { id: message.id, result: meetsPoolDiff, error: meetsPoolDiff ? null : [-23, 'Invalid share', null] });
+
+                // Handle block submission if meets network difficulty
+                if (meetsNetworkDiff) {
+                    console.log(`🎉 Potential block found by ${miner.username}! Submitting...`);
+                    const blockHex = this.buildFullBlock(blockHeader, miner, extranonce2);
+                    this.bitcoin.submitBlock(blockHex).then(result => {
+                        console.log(`Block submission result: ${JSON.stringify(result)}`);
+                        if (!result || result === 'inconclusive') {
+                            this.db.logBlockFound(miner.id, blockHash.toString('hex'), this.currentJob.height);
+                        }
+                    }).catch(error => {
+                        console.error(`❌ Block submission failed: ${error.message}`);
+                    });
+                }
                 break;
             
             case 'mining.configure':
@@ -790,17 +923,12 @@ class RealStratumServer extends EventEmitter {
         setInterval(async () => {
             console.log(`🕒 Batch processor tick, queue size: ${this.shareQueue.length}`);
             if (this.shareQueue.length > 0) {
-                const batch = this.shareQueue.splice(0, 1000); // Handle 500 TH/s
+                const batch = this.shareQueue.splice(0, 5000); // Handle 500 TH/s
                 console.log(`📦 Processing batch of ${batch.length} shares...`);
                 try {
                     const validShares = batch.filter(s => s.isValid).length;
-                    
                     for (const share of batch) {
                         try {
-                            // Mock DB for testing
-                            console.log(`Mock logging share for ${share.minerId}: valid=${share.isValid}`);
-                            // Uncomment real DB call after confirming
-                            /*
                             await this.db.logShare(
                                 share.minerId,
                                 share.jobId,
@@ -811,15 +939,14 @@ class RealStratumServer extends EventEmitter {
                                 share.blockHash,
                                 share.processingTime
                             );
-                            */
+                            console.log(`✅ Logged share for ${share.minerId}: valid=${share.isValid}`);
                         } catch (dbErr) {
-                            console.error(`DB logShare error for miner ${share.minerId}:`, dbErr.message);
+                            console.error(`❌ DB logShare error for miner ${share.minerId}:`, dbErr.message);
                         }
                     }
-                    
                     console.log(`📊 Processed ${batch.length} shares (${validShares} valid)`);
                 } catch (error) {
-                    console.error('Batch processing error:', error.message);
+                    console.error('❌ Batch processing error:', error.message);
                 }
             }
         }, 5000);
