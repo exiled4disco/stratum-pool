@@ -487,7 +487,13 @@ class RealStratumServer extends EventEmitter {
             const hash = this.calculateBlockHash(blockHeader);
             
             // Pool difficulty check with fixed endianness comparison
-            const poolTarget = this.difficultyToTarget(miner.difficulty);
+            let poolTarget;
+            if (miner.difficulty < 0.000015) {
+                // Cap to maximum target for very low difficulty (all hashes pass for testing)
+                poolTarget = Buffer.alloc(32, 0xff); // ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+            } else {
+                poolTarget = this.difficultyToTarget(miner.difficulty);
+            }
             
             // Reverse both hash and target for little-endian comparison
             const reversedHash = Buffer.from(hash).reverse();
@@ -553,27 +559,48 @@ class RealStratumServer extends EventEmitter {
         try {
             const job = this.currentJob;
             
-            if (!job.coinb1 || !job.coinb2 || !miner.extranonce1 || !extranonce2) {
-                throw new Error('Missing coinbase components');
+            if (!job.coinb1 || !job.coinb2 || !miner.extranonce1) {
+                throw new Error('Missing coinbase components: coinb1, coinb2, or extranonce1');
             }
             
-            let coinbaseTx = job.coinb1 + miner.extranonce1 + extranonce2 + job.coinb2;
+            let totalExtranonceLength = miner.extranonce1.length / 2; // Hex chars to bytes
             
+            // Append extranonce2 length if non-empty
+            if (extranonce2 && extranonce2 !== '') {
+                totalExtranonceLength += extranonce2.length / 2;
+            }
+            
+            // Adjust coinb1 length prefix (last byte of coinb1 is typically the push length for extranonce)
+            let adjustedCoinb1 = job.coinb1.substring(0, job.coinb1.length - 2); // Remove last 2 hex chars (1 byte length)
+            const lengthHex = totalExtranonceLength.toString(16).padStart(2, '0'); // e.g., '04' for 4 bytes
+            adjustedCoinb1 += lengthHex;
+            
+            let coinbaseTx = adjustedCoinb1 + miner.extranonce1;
+            
+            // Append extranonce2 if non-empty
+            if (extranonce2 && extranonce2 !== '') {
+                coinbaseTx += extranonce2;
+            }
+            
+            coinbaseTx += job.coinb2;
+            
+            // Add witness commitment if present
             if (job.default_witness_commitment) {
                 coinbaseTx += job.default_witness_commitment;
             }
             
+            // Validate final hex
             if (!/^[0-9a-fA-F]+$/.test(coinbaseTx)) {
                 throw new Error('Invalid hex format in coinbase transaction');
             }
             
+            console.log(`✅ Coinbase reconstructed: length=${coinbaseTx.length} chars, total extranonce length=${totalExtranonceLength} bytes`);
             return coinbaseTx;
         } catch (error) {
             console.error('Coinbase reconstruction error:', error.message);
             return null;
         }
     }
-
     buildFullBlock(header, miner, extranonce2) {
         try {
             const headerBuffer = Buffer.isBuffer(header) ? header : Buffer.from(header, 'hex');
@@ -583,15 +610,16 @@ class RealStratumServer extends EventEmitter {
             }
             
             const transactions = this.currentJob.transactions || [];
-            const txCount = transactions.length + 1;
+            const txCount = transactions.length + 1; // +1 for coinbase
             
             const blockParts = [];
             
-            // Block header
+            // Block header (80 bytes)
             blockParts.push(headerBuffer);
             
-            // Transaction count
-            const txCountBuffer = Buffer.from(this.encodeVarint(txCount), 'hex');
+            // Transaction count (varint)
+            const txCountHex = this.encodeVarint(txCount);
+            const txCountBuffer = Buffer.from(txCountHex, 'hex');
             blockParts.push(txCountBuffer);
             
             // Coinbase transaction
@@ -599,17 +627,14 @@ class RealStratumServer extends EventEmitter {
             if (!coinbaseTx) {
                 throw new Error('Failed to reconstruct coinbase transaction');
             }
-            
             blockParts.push(Buffer.from(coinbaseTx, 'hex'));
             
             // Other transactions
             for (let i = 0; i < transactions.length; i++) {
                 const tx = transactions[i];
-                
                 if (!tx.data) {
                     throw new Error(`Transaction ${i} missing data field`);
                 }
-                
                 blockParts.push(Buffer.from(tx.data, 'hex'));
             }
             
@@ -619,8 +644,8 @@ class RealStratumServer extends EventEmitter {
                 throw new Error(`Block size ${blockBuffer.length} exceeds 4MB limit`);
             }
             
+            console.log(`✅ Block constructed: size=${blockBuffer.length} bytes, tx count=${txCount}`);
             return blockBuffer.toString('hex');
-            
         } catch (error) {
             console.error('Block construction failed:', error.message);
             return null;
