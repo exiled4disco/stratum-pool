@@ -10,7 +10,7 @@ class RealStratumServer extends EventEmitter {
         super();
         this.config = {
             port: config.port || 3333,
-            difficulty: config.difficulty || 1,
+            difficulty: config.difficulty || 1.0,
             poolAddress: config.poolAddress || '1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa',
             ...config
         };
@@ -200,32 +200,32 @@ class RealStratumServer extends EventEmitter {
         
         return result;
     }
-    adjustMinerDifficulty(miner) {
-        const now = Date.now();
-        const timeSinceLastAdjust = now - (miner.lastDifficultyAdjust || now);
-        
-        if (timeSinceLastAdjust < 60000) return;
-        
-        const targetSharesPerMinute = 6; // ~6 shares/min per miner
-        const timeWindowMinutes = Math.min(timeSinceLastAdjust / 60000, 10);
-        const actualSharesPerMinute = (miner.validShares || 0) / timeWindowMinutes;
-        
-        let newDifficulty = miner.difficulty;
-        
-        if (actualSharesPerMinute > targetSharesPerMinute * 1.5) {
-            newDifficulty = miner.difficulty * 2;
-        } else if (actualSharesPerMinute < targetSharesPerMinute * 0.5 && miner.validShares > 5) {
-            newDifficulty = Math.max(miner.difficulty * 0.5, 0.001);
-        }
-        
-        if (Math.abs(newDifficulty - miner.difficulty) / miner.difficulty > 0.1) {
-            console.log(`🎯 Adjusting ${miner.username} difficulty: ${miner.difficulty.toFixed(6)} → ${newDifficulty.toFixed(6)}`);
-            miner.difficulty = newDifficulty;
-            miner.lastDifficultyAdjust = now;
-            miner.validShares = 0;
-            this.sendDifficulty(miner);
-        }
-    }
+//    adjustMinerDifficulty(miner) {
+//        const now = Date.now();
+//        const timeSinceLastAdjust = now - (miner.lastDifficultyAdjust || now);
+//        
+//        if (timeSinceLastAdjust < 60000) return;
+//        
+//        const targetSharesPerMinute = 6; // ~6 shares/min per miner
+//        const timeWindowMinutes = Math.min(timeSinceLastAdjust / 60000, 10);
+//        const actualSharesPerMinute = (miner.validShares || 0) / timeWindowMinutes;
+//        
+//        let newDifficulty = miner.difficulty;
+//        
+//        if (actualSharesPerMinute > targetSharesPerMinute * 1.5) {
+//            newDifficulty = miner.difficulty * 2;
+//        } else if (actualSharesPerMinute < targetSharesPerMinute * 0.5 && miner.validShares > 5) {
+//            newDifficulty = Math.max(miner.difficulty * 0.5, 0.001);
+//       }
+//        
+//        if (Math.abs(newDifficulty - miner.difficulty) / miner.difficulty > 0.1) {
+//            console.log(`🎯 Adjusting ${miner.username} difficulty: ${miner.difficulty.toFixed(6)} → ${newDifficulty.toFixed(6)}`);
+//            miner.difficulty = newDifficulty;
+//            miner.lastDifficultyAdjust = now;
+//            miner.validShares = 0;
+//            this.sendDifficulty(miner);
+//        }
+//    }
 
     handleConnection(socket) {
         const startTime = Date.now();
@@ -235,7 +235,7 @@ class RealStratumServer extends EventEmitter {
             socket: socket,
             subscribed: false,
             authorized: false,
-            difficulty: 1, 
+            difficulty: 1.0, 
             lastActivity: Date.now(),
             address: socket.remoteAddress,
             shares: 0,
@@ -868,7 +868,7 @@ class RealStratumServer extends EventEmitter {
 // Start the real stratum server
 const server = new RealStratumServer({
     port: 3333,
-    difficulty: 1,
+    difficulty: 1.0,
     poolAddress: '1GWVQpX8bnwkQsLYHrdzQqma7vWXbp9zFH'
 });
 
