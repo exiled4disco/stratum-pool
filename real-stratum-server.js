@@ -15,7 +15,10 @@ class RealStratumServer extends EventEmitter {
             ...config
         };
        
-        this.extranonce1Size = 4;
+        // Extranonce configuration matching bitcoin-connector.js
+        this.extranonce1Size = 4; // Bytes (8 hex chars)
+        this.extranonce2Size = 4; // Bytes (8 hex chars)
+        
         this.miners = new Map();
         this.server = net.createServer();
         this.jobCounter = 0;
@@ -107,7 +110,7 @@ class RealStratumServer extends EventEmitter {
             console.log(`DEBUG getblocktemplate response: ${JSON.stringify(job, null, 2)}`);
             // Validate critical fields
             if (!job.coinb1 || !job.coinb2 || !job.transactions || !job.nbits || !job.ntime || !job.height) {
-                console.error(`❌ Invalid job: missing required fields (coinb1=${!!job.coinb1}, coinb2=${!!job.coinb2}, transactions=${!!job.transactions}, nbits=${!!job.ntime}, height=${!!job.height})`);
+                console.error(`❌ Invalid job: missing required fields (coinb1=${!!job.coinb1}, coinb2=${!!job.coinb2}, transactions=${!!job.transactions}, nbits=${!!job.nbits}, ntime=${!!job.ntime}, height=${!!job.height})`);
                 console.log('DEBUG Attempting retry in 10s...');
                 setTimeout(() => this.updateWork(), 10000);
                 return;
@@ -227,675 +230,468 @@ class RealStratumServer extends EventEmitter {
             shares: 0,
             validShares: 0,
             connectTime: startTime,
-            rollingMask: null
+            username: 'unknown', // Default, updated on authorize
+            subscriptionId: null,
+            extranonce1: null,
+            extranonce2Size: this.extranonce2Size,
+            supportsVersionRolling: false,
+            rollingMask: null,
+            minBitCount: 0
         };
 
         this.miners.set(minerId, miner);
         console.log(`🔗 NEW CONNECTION: ${miner.address} (${minerId.substring(0, 8)})`);
+        console.log(`🎯 Waiting for messages from ${miner.address}...`);
 
+        // Log miner connection to DB immediately to prevent FK violations
         this.db.logMinerConnection(minerId, miner.username, miner.address).catch(err => {
             console.error(`❌ Failed to log miner connection for ${minerId}: ${err.message}`);
         });
 
-        this.monitor.recordMinerConnection(minerId, 'new-connection', socket.remoteAddress);
-        
-        // Increase timeout for debugging
-        socket.setTimeout(600000); // 10 minutes
-
-        const keepAlive = setInterval(() => {
-            if (socket.writable && !socket.destroyed) {
-                // Don't send keepalive during debugging - it might interfere
-                // socket.write('\n');
-            } else {
-                clearInterval(keepAlive);
-            }
-        }, 30000);        
-
-        socket.on('data', (data) => {
-            console.log(`📡 DATA EVENT for ${miner.address}`);
-            this.handleData(minerId, data);
-        });
-
-        socket.on('close', () => {
-            const duration = Date.now() - startTime;
-            const avgTimePerShare = miner.shares > 0 ? duration / miner.shares : 0;
-            
-            console.log(`🔌 CONNECTION CLOSED: ${miner.address} (${minerId.substring(0, 8)})`);
-            console.log(`   Duration: ${duration}ms`);
-            console.log(`   Subscribed: ${miner.subscribed}`);
-            console.log(`   Authorized: ${miner.authorized}`);
-            console.log(`   Shares: ${miner.shares}`);
-            
-            this.db.logMinerDisconnection(miner.id);
-            this.monitor.recordMinerDisconnection(miner.id, miner.username || 'unknown');
-            
-            clearInterval(keepAlive);
-            this.miners.delete(minerId);
-            socket.removeAllListeners();
-        });
-
-        socket.on('timeout', () => {
-            console.log(`⏰ SOCKET TIMEOUT for ${miner.address}`);
-            socket.destroy();
-        });
-
+        // Socket events
+        socket.on('data', (data) => this.handleData(minerId, data));
+        socket.on('end', () => this.handleDisconnect(minerId));
         socket.on('error', (err) => {
-            console.log(`💥 SOCKET ERROR for ${miner.address}: ${err.message}`);
-            clearInterval(keepAlive);
-            this.miners.delete(minerId);
-            socket.destroy();
+            console.error(`Socket error for ${miner.address}: ${err.message}`);
+            this.handleDisconnect(minerId);
         });
-        
-        console.log(`🎯 Waiting for messages from ${miner.address}...`);
+        socket.on('close', () => this.handleDisconnect(minerId));
+        socket.setTimeout(300000); // 5 min timeout
+        socket.on('timeout', () => {
+            console.log(`Socket timeout for ${miner.address}`);
+            this.handleDisconnect(minerId);
+        });
+
+        // Keepalive ping every 30s
+        const keepaliveInterval = setInterval(() => {
+            if (miner.socket.writable && !miner.socket.destroyed) {
+                this.sendMessage(miner.socket, { id: null, method: 'mining.ping', params: [] });
+            }
+        }, 30000);
+        miner.keepaliveInterval = keepaliveInterval;
     }
 
     handleData(minerId, data) {
         const miner = this.miners.get(minerId);
         if (!miner) return;
+
+        miner.lastActivity = Date.now();
         const messages = data.toString().split('\n').filter(msg => msg.trim());
+        
         for (const messageStr of messages) {
             console.log(`📥 RAW DATA from ${miner.address}: ${messageStr}`);
+            
+            // Reject HTTP requests
+            if (messageStr.startsWith('POST') || messageStr.startsWith('GET') || messageStr.startsWith('HTTP')) {
+                console.log(`⚠️ Rejecting HTTP request from ${miner.address}`);
+                this.sendError(miner.socket, null, 20, 'Invalid protocol: HTTP not supported');
+                miner.socket.destroy();
+                continue;
+            }
+            
             try {
                 const message = JSON.parse(messageStr);
                 console.log(`📨 PARSED MESSAGE from ${miner.address}: ${JSON.stringify(message)}`);
-                this.processMessage(minerId, message); // Add this line
+                this.processMessage(minerId, message);
             } catch (err) {
                 console.log(`⚠️ JSON/RUNTIME ERROR from ${miner.address}: ${err.message}`);
+                this.sendError(miner.socket, null, 20, `Parse error: ${err.message}`);
             }
         }
     }
 
-// Then utility methods like difficultyToTarget
-
     processMessage(minerId, message) {
         const miner = this.miners.get(minerId);
-        if (!miner) {
-            console.log(`❌ No miner found for ID ${minerId}`);
-            return;
-        }
+        if (!miner) return;
 
         const { id, method, params } = message;
         console.log(`🔄 PROCESSING ${method} from ${miner.address} (ID: ${minerId.substring(0, 8)})`);
 
         switch (method) {
             case 'mining.configure':
-                console.log(`🔧 Handling mining.configure from ${miner.address}: extensions=${JSON.stringify(params)}`);
-                const extensions = params && params[0] ? params[0] : [];
-                const config = params && params[1] ? params[1] : {};
-                miner.supportsVersionRolling = false;
-
-                const resultObj = {};  // Object/map for BIP-310 compliance
-
-                if (extensions.includes('version-rolling')) {
-                    const mask = config['version-rolling.mask'] || '1fffe000';
-                    const minBitCount = parseInt(config['version-rolling.min-bit-count']) || 16;
-                    miner.rollingMask = mask;
-                    miner.minBitCount = minBitCount;
-                    miner.supportsVersionRolling = true;
-                    resultObj['version-rolling'] = true;  // Confirm support
-                    resultObj['version-rolling.mask'] = mask;  // Echo mask (adjust if needed, e.g., bitwise AND with server mask)
-                    resultObj['version-rolling.min-bit-count'] = minBitCount;  // Echo for diagnostics
-                    console.log(`✅ Version-rolling enabled for ${miner.address}: mask=${mask}, min-bits=${minBitCount}`);
-                } else {
-                    // If no extensions or unsupported, set false for requested ones
-                    for (const ext of extensions) {
-                        resultObj[ext] = false;
-                    }
-                }
-
-                // For unknown extensions, BIP-310 allows omitting or setting false—here we set false if not handled
-                try {
-                    this.sendMessage(miner.socket, {
-                        id: id,
-                        result: resultObj,  // Object: { "version-rolling": true, "version-rolling.mask": "...", ... }
-                        error: null
-                    });
-                    if (miner.supportsVersionRolling) {
-                        this.sendDifficulty(miner);  // Proactive difficulty after successful config
-                    }
-                } catch (err) {
-                    console.error(`❌ Error sending configure response to ${miner.address}: ${err.message}`);
-                    miner.socket.destroy();
-                }
+                this.handleConfigure(miner, id, params);
                 break;
-
             case 'mining.subscribe':
-                console.log(`🔄 PROCESSING mining.subscribe from ${miner.address}`);
-                const subscriptionId = crypto.randomBytes(4).toString('hex');
-                const extranonce1Size = 4; // Match bitcoin-connector.js
-                miner.subscribed = true;
-                miner.subscriptionId = subscriptionId;
-                miner.extranonce1 = crypto.randomBytes(extranonce1Size).toString('hex');
-                miner.extranonce2Size = 4; // Match bitcoin-connector.js
-                miner.difficulty = 1; // Good for ASICs
-                miner.shareCount = 0;
-                miner.validShares = 0;
-                miner.lastDifficultyAdjust = Date.now();
-
-                try {
-                    this.sendMessage(miner.socket, {
-                        id: id,
-                        result: [[], miner.extranonce1, extranonce1Size], // Use local variable
-                        error: null
-                    });
-                    this.sendDifficulty(miner);
-                    if (this.currentJob) {
-                        this.sendJob(miner);
-                    } else {
-                        console.warn(`⚠️ No current job available for ${miner.address}`);
-                    }
-                    console.log(`✅ Subscribed ${miner.address}: subscriptionId=${subscriptionId}, extranonce1=${miner.extranonce1}, extranonce2Size=${miner.extranonce2Size}`);
-                    this.monitor.recordMinerConnection(minerId, miner.username || 'unknown', miner.address);
-                } catch (err) {
-                    console.error(`❌ Error sending subscribe response to ${miner.address}: ${err.message}`);
-                    miner.socket.destroy();
-                }
+                this.handleSubscribe(miner, id, params);
                 break;
-            
-
-
-            case 'mining.submit':
-                console.log(`🔄 PROCESSING mining.submit from ${miner.address}: params=${JSON.stringify(params)}`);
-                const startTime = Date.now();
-                const usernameSubmit = params && params[0] ? params[0] : miner.username;
-                const jobId = params && params[1] ? params[1] : null;
-                const extranonce2 = params && params[2] ? params[2] : null;
-                const ntime = params && params[3] ? params[3] : null;
-                const nonce = params && params[4] ? params[4] : null;
-                const versionRolled = miner.supportsVersionRolling && params[5] ? params[5] : null;
-
-                if (!miner.authorized || !miner.subscribed) {
-                    this.sendError(miner.socket, id, 24, 'Not subscribed or authorized');
-                    console.log(`❌ Submit rejected: ${miner.address} not subscribed or authorized`);
-                    return;
-                }
-
-                if (!jobId || !extranonce2 || !ntime || !nonce || jobId !== this.currentJob?.jobId) {
-                    this.sendError(miner.socket, id, 21, 'Invalid job or parameters');
-                    console.log(`❌ Submit rejected: Invalid jobId=${jobId} or missing params`);
-                    return;
-                }
-
-                miner.shares += 1;
-                const processingTime = Date.now() - startTime;
-
-                const header = this.buildOptimizedBlockHeader(miner, extranonce2, ntime, nonce, versionRolled);
-                const blockHash = this.calculateBlockHash(header).reverse().toString('hex');
-                const poolTarget = this.difficultyToTarget(miner.difficulty);
-                const networkTarget = this.difficultyToTarget(this.cachedNetworkDifficulty || 73197670707408.73);
-
-                const meetsPoolDiff = this.meetsTarget(blockHash, poolTarget);
-                const meetsNetworkDiff = this.meetsTarget(blockHash, networkTarget);
-                const isValid = meetsPoolDiff;
-
-                miner.validShares += isValid ? 1 : 0;
-                this.adjustMinerDifficulty(miner);
-
-                const shareData = {
-                    minerId,
-                    jobId,
-                    nonce,
-                    isValid,
-                    meetsPoolDiff,
-                    meetsNetworkDiff,
-                    blockHash,
-                    processingTime
-                };
-                this.shareQueue.push(shareData);
-
-                this.db.logShare(minerId, jobId, nonce, isValid, meetsPoolDiff, meetsNetworkDiff, blockHash, processingTime);
-
-                if (meetsNetworkDiff) {
-                    console.log(`🎉 BLOCK CANDIDATE FOUND by ${miner.address}: hash=${blockHash}`);
-                    this.submitFoundBlock(header, miner, extranonce2);
-                }
-
-                this.sendMessage(miner.socket, {
-                    id: id,
-                    result: isValid,
-                    error: isValid ? null : [22, 'Share rejected - low difficulty', null]
-                });
-                console.log(`💎 Share processed for ${miner.address}: valid=${isValid}, meetsNetworkDiff=${meetsNetworkDiff}`);
-                this.emit('validShare', { miner, nonce, blockHash });
-                break;
-
-            default:
-                console.warn(`⚠️ Unknown method '${method}' from ${miner.address}`);
-                this.sendError(miner.socket, id, 20, `Unknown method: ${method}`);
-                break;
-
             case 'mining.authorize':
-                console.log(`🔄 PROCESSING mining.authorize from ${miner.address}: username=${params[0]}, password=${params[1]}`);
-                const username = params && params[0] ? params[0] : null;
-                const password = params && params[1] ? params[1] : null;
-
-                // Validate username (solo mining: require non-empty username)
-                if (!username || typeof username !== 'string' || username.trim() === '') {
-                    console.error(`❌ Invalid username from ${miner.address}: ${username}`);
-                    this.sendError(miner.socket, id, 21, 'Invalid or missing username');
-                    miner.socket.destroy();
-                    break;
-                }
-
-                try {
-                    // Update miner object
-                    miner.username = username;
-                    miner.authorized = true;
-                    miner.lastActivity = Date.now();
-
-                    // Update/insert miner record in database
-                    await this.db.logMinerConnection(miner.id, username, miner.address);
-
-                    // Send authorization response
-                    this.sendMessage(miner.socket, {
-                        id: id,
-                        result: true, // Success for solo mining
-                        error: null
-                    });
-
-                    console.log(`✅ Authorized ${miner.address}: username=${username}, minerId=${miner.id.substring(0, 8)}`);
-
-                    // Send current job if available
-                    if (this.currentJob) {
-                        this.sendJob(miner);
-                        console.log(`📤 Sent job ${this.currentJob.jobId} to ${miner.address}`);
-                    } else {
-                        console.warn(`⚠️ No current job available for ${miner.address}`);
-                    }
-
-                    // Log to monitoring system
-                    this.monitor.recordMinerConnection(miner.id, username, miner.address);
-                } catch (err) {
-                    console.error(`❌ Error during authorization for ${miner.address}: ${err.message}`);
-                    this.sendError(miner.socket, id, 20, `Authorization failed: ${err.message}`);
-                    miner.socket.destroy();
-                }
+                this.handleAuthorize(miner, id, params);
                 break;
+            case 'mining.submit':
+                this.handleSubmit(minerId, id, params);
+                break;
+            default:
+                console.log(`⚠️ Unknown method '${method}' from ${miner.address}`);
+                this.sendError(miner.socket, id, 20, `Unknown method: ${method}`);
+        }
+    }
+
+    handleConfigure(miner, id, params) {
+        console.log(`🔧 Handling mining.configure from ${miner.address}: extensions=${JSON.stringify(params)}`);
+        const extensions = params && params[0] ? params[0] : [];
+        const config = params && params[1] ? params[1] : {};
+        miner.supportsVersionRolling = false;
+
+        const resultObj = {};  // Object/map for BIP-310 compliance
+
+        if (extensions.includes('version-rolling')) {
+            const mask = config['version-rolling.mask'] || '1fffe000';
+            const minBitCount = parseInt(config['version-rolling.min-bit-count']) || 16;
+            miner.rollingMask = mask;
+            miner.minBitCount = minBitCount;
+            miner.supportsVersionRolling = true;
+            resultObj['version-rolling'] = true;  // Confirm support
+            resultObj['version-rolling.mask'] = mask;  // Echo mask
+            resultObj['version-rolling.min-bit-count'] = minBitCount;  // Echo for diagnostics
+            console.log(`✅ Version-rolling enabled for ${miner.address}: mask=${mask}, min-bits=${minBitCount}`);
+        } else {
+            // If no extensions or unsupported, set false for requested ones
+            for (const ext of extensions) {
+                resultObj[ext] = false;
+            }
+        }
+
+        try {
+            this.sendMessage(miner.socket, {
+                id: id,
+                result: resultObj,  // Object: { "version-rolling": true, "version-rolling.mask": "...", ... }
+                error: null
+            });
+            if (miner.supportsVersionRolling) {
+                this.sendDifficulty(miner);  // Proactive difficulty after successful config
+            }
+        } catch (err) {
+            console.error(`❌ Error sending configure response to ${miner.address}: ${err.message}`);
+            miner.socket.destroy();
+        }
+    }
 
     handleSubscribe(miner, id, params) {
+        console.log(`🔄 PROCESSING mining.subscribe from ${miner.address}`);
         const subscriptionId = crypto.randomBytes(4).toString('hex');
-        const extranonce1 = crypto.randomBytes(4).toString('hex');
-        const extranonce2Size = 4; // Bytes, matches your config (4B = 8 hex chars)
-
+        const extranonce1Size = this.extranonce1Size;
+        const extranonce2Size = this.extranonce2Size;
         miner.subscribed = true;
         miner.subscriptionId = subscriptionId;
-        miner.extranonce1 = extranonce1;
+        miner.extranonce1 = crypto.randomBytes(extranonce1Size).toString('hex');
         miner.extranonce2Size = extranonce2Size; // Store for validation
-        miner.difficulty = 4; // Initial difficulty for S9 (~1 valid every ~111 ms at 13 TH/s)
+        miner.difficulty = 1; // Temporary for testing S9 (~14 TH/s, ~400 shares/s, ~12 valid/s)
         miner.shareCount = 0;
         miner.validShares = 0;
         miner.lastDifficultyAdjust = Date.now();
 
-        const response = {
-            id: id,
-            result: [
-                [
-                    ["mining.set_difficulty", subscriptionId],
-                    ["mining.notify", subscriptionId]
+        try {
+            // Send Stratum-compliant response (empty subscriptions for solo mining)
+            this.sendMessage(miner.socket, {
+                id: id,
+                result: [
+                    [], // Empty subscriptions array
+                    miner.extranonce1, // 4 bytes = 8 hex chars
+                    extranonce2Size // 4 bytes
                 ],
-                extranonce1, // 4 bytes = 8 hex
-                extranonce2Size // 4 bytes for miner-generated extranonce2
-            ],
-            error: null
-        };
-        this.sendMessage(miner.socket, response);
-        this.sendDifficulty(miner);
+                error: null
+            });
+            console.log(`DEBUG Subscribe sent: extranonce1=${miner.extranonce1}, size=${extranonce2Size}`);
 
-        if (this.currentJob) {
-            this.sendJob(miner);
-        }
-        // Periodic job refresh to prevent timeout
-        setInterval(() => {
-            if (miner.subscribed && miner.authorized && this.currentJob && miner.socket.writable && !miner.socket.destroyed) {
+            // Send initial difficulty
+            this.sendDifficulty(miner);
+
+            // Send current job if available
+            if (this.currentJob) {
                 this.sendJob(miner);
-                console.log(`🔄 Sent job refresh to ${miner.address}`);
+                console.log(`📤 Sent job ${this.currentJob.jobId} to ${miner.address}`);
+            } else {
+                console.warn(`⚠️ No current job available for ${miner.address}`);
             }
-        }, 30000);
-        console.log(`✅ Miner subscribed: ${miner.address} (extranonce1: ${extranonce1}, extranonce2_size: ${extranonce2Size}, difficulty: ${miner.difficulty})`);
+
+            // Log miner connection to prevent FK violations (username may be unknown yet)
+            this.db.logMinerConnection(miner.id, miner.username || 'unknown', miner.address).catch(err => {
+                console.error(`❌ Failed to log miner connection for ${miner.id}: ${err.message}`);
+            });
+
+            console.log(`✅ Miner subscribed: ${miner.address} (extranonce1: ${miner.extranonce1}, extranonce2_size: ${extranonce2Size}, difficulty: ${miner.difficulty})`);
+            this.monitor.recordMinerConnection(miner.id, miner.username || 'unknown', miner.address);
+        } catch (err) {
+            console.error(`❌ Error sending subscribe response to ${miner.address}: ${err.message}`);
+            this.sendError(miner.socket, id, 20, `Subscribe failed: ${err.message}`);
+            miner.socket.destroy();
+        }
     }
 
-    handleAuthorize(miner, id, params) {
-        const [username, password] = params;
-        
-        miner.authorized = true;
-        miner.username = username;
-        
-        this.db.logMinerConnection(miner.id, username, miner.address);
-        
-        const response = {
-            id: id,
-            result: true,
-            error: null
-        };
+    async handleAuthorize(miner, id, params) {
+        console.log(`🔄 PROCESSING mining.authorize from ${miner.address}: username=${params[0]}, password=${params[1]}`);
+        const username = params && params[0] ? params[0] : null;
+        const password = params && params[1] ? params[1] : null;
 
-        this.sendMessage(miner.socket, response);
-        this.sendDifficulty(miner);
-        
-        console.log(`Miner authorized: ${username} from ${miner.address} - Using difficulty ${miner.difficulty}`);
+        // Validate username (solo mining: require non-empty username)
+        if (!username || typeof username !== 'string' || username.trim() === '') {
+            console.error(`❌ Invalid username from ${miner.address}: ${username}`);
+            this.sendError(miner.socket, id, 21, 'Invalid or missing username');
+            miner.socket.destroy();
+            return; // Exit function cleanly
+        }
+
+        try {
+            // Update miner object
+            miner.username = username;
+            miner.authorized = true;
+            miner.lastActivity = Date.now();
+
+            // Update/insert miner record in database to prevent FK violations
+            await this.db.logMinerConnection(miner.id, username, miner.address);
+
+            // Send authorization response
+            this.sendMessage(miner.socket, {
+                id: id,
+                result: true, // Success for solo mining
+                error: null
+            });
+
+            console.log(`✅ Authorized ${miner.address}: username=${username}, minerId=${miner.id.substring(0, 8)}`);
+
+            // Send current job if available
+            if (this.currentJob) {
+                this.sendJob(miner);
+                console.log(`📤 Sent job ${this.currentJob.jobId} to ${miner.address}`);
+            } else {
+                console.warn(`⚠️ No current job available for ${miner.address}`);
+            }
+
+            // Log to monitoring system
+            this.monitor.recordMinerConnection(miner.id, username, miner.address);
+        } catch (err) {
+            console.error(`❌ Error during authorization for ${miner.address}: ${err.message}`);
+            this.sendError(miner.socket, id, 20, `Authorization failed: ${err.message}`);
+            miner.socket.destroy();
+        }
     }
 
-    async handleSubmit(miner, id, params) {
-        if (!miner.authorized) {
-            this.sendError(miner.socket, id, -24, 'Unauthorized worker');
+    handleSubmit(minerId, id, params) {
+        const miner = this.miners.get(minerId);
+        if (!miner || !miner.authorized || !this.currentJob) {
+            this.sendError(miner.socket, id, 20, 'Unauthorized or no job');
             return;
         }
 
-        const [username, jobId, extranonce2, time, nonce, versionRolled = null] = params;  // Capture 6th param
-        miner.shares++;
-        
-        // Pass versionRolled to validateShare
-        const isValid = await this.validateShare(miner, jobId, extranonce2, time, nonce, versionRolled);
-        
-        if (isValid) {
-            miner.validShares++;
-            this.adjustMinerDifficulty(miner);
-        }
-        
-        const response = {
-            id: id,
-            result: isValid,
-            error: isValid ? null : [-23, 'Invalid share', null]
-        };
+        // Destructure 6 params for version-rolling
+        const [workerName, jobId, extranonce2, ntime, nonce, rolledVersion] = params;
+        const startTime = Date.now();
 
-        this.sendMessage(miner.socket, response);
-        
-        if (isValid) {
-            console.log(`✅ Valid share from ${username} (${miner.validShares}/${miner.shares})`);
-            this.emit('validShare', { miner, jobId, nonce });
-        }
-    }
-        
-    async validateShare(miner, jobId, extranonce2, time, nonce, versionRolled = null) {
-        console.log(`🔍 Validating share for ${miner.username}: jobId=${jobId}, extranonce2=${extranonce2}, time=${time}, nonce=${nonce}, versionRolled=${versionRolled}`);
-        
-        if (!this.currentJob || jobId !== this.currentJob.jobId) {
-            console.log(`❌ Invalid share: Job ${jobId} not found or stale`);
-            return false;
-        }
-        
-        if ((extranonce2 !== '' && !/^[0-9a-fA-F]+$/.test(extranonce2)) || 
-            !time || !nonce || !/^[0-9a-fA-F]+$/.test(time) || !/^[0-9a-fA-F]+$/.test(nonce)) {
-            console.log(`❌ Invalid share: Malformed parameters (extranonce2=${extranonce2}, time=${time}, nonce=${nonce})`);
-            return false;
-        }
-        
-        if (versionRolled) {
-            if (!/^[0-9a-fA-F]{8}$/.test(versionRolled)) {
-                console.log(`❌ Invalid share: Malformed versionRolled=${versionRolled}`);
-                return false;
-            }
-            const version = parseInt(versionRolled, 16);
-            const baseVersion = parseInt(this.currentJob.version, 16);
-            const mask = parseInt(miner.rollingMask || '1fffe000', 16);
-            if ((version & ~mask) !== (baseVersion & ~mask)) {
-                console.log(`⚠️ Version rolling mismatch (relaxed accept): ${versionRolled} (base: ${this.currentJob.version}, mask: ${miner.rollingMask})`);
-            } else {
-                console.log(`✅ Version rolling valid: ${versionRolled} matches mask ${miner.rollingMask}`);
-            }
-        }
-        
-        try {
-            const blockHeader = this.buildOptimizedBlockHeader(miner, extranonce2, time, nonce, versionRolled);
-            const hash = this.calculateBlockHash(blockHeader);
-            
-            // Real pool difficulty check (no cap)
-            const poolTarget = this.difficultyToTarget(miner.difficulty);
-            
-            const reversedHash = Buffer.from(hash).reverse();
-            const reversedTarget = poolTarget.reverse();
-            
-            console.log(`DEBUG Full reversed hash: ${reversedHash.toString('hex')}`);
-            console.log(`DEBUG Full reversed target: ${reversedTarget.toString('hex')}`);
-            console.log(`DEBUG: Diff=${miner.difficulty}, Target=${reversedTarget.toString('hex').substring(0, 16)}..., Hash=${reversedHash.toString('hex').substring(0, 16)}..., Compare=${reversedHash.compare(reversedTarget)}`);
-            
-            const meetsPoolDifficulty = reversedHash.compare(reversedTarget) <= 0;
-            
-            let meetsNetworkDifficulty = false;
-            if (meetsPoolDifficulty) {
-                const networkDifficulty = await this.getNetworkTarget();
-                const networkTarget = this.difficultyToTarget(networkDifficulty);
-                const reversedNetworkTarget = networkTarget.reverse();
-                meetsNetworkDifficulty = reversedHash.compare(reversedNetworkTarget) <= 0;
-                
-                if (meetsNetworkDifficulty) {
-                    console.log('🎉 BLOCK FOUND!');
-                    const blockHash = reversedHash.toString('hex');
-                    await this.db.logBlockFound(miner.id, blockHash, this.currentJob.height);
-                    await this.submitFoundBlock(blockHeader, miner, extranonce2);
-                }
-            }
-            
-            this.shareQueue.push({
-                minerId: miner.id,
-                jobId,
-                nonce,
-                isValid: meetsPoolDifficulty,
-                meetsPoolDiff: meetsPoolDifficulty,
-                meetsNetworkDiff: meetsNetworkDifficulty,
-                blockHash: reversedHash.toString('hex'),
-                processingTime: Date.now() - miner.lastActivity
+        if (jobId !== this.currentJob.jobId) {
+            console.log(`❌ Rejected stale share for job ${jobId}, current is ${this.currentJob.jobId}`);
+            this.sendMessage(miner.socket, {
+                id: id,
+                result: false,
+                error: null
             });
-            console.log(`Share queued: valid=${meetsPoolDifficulty}`);
-            
-            console.log(`🔍 Share validation result: ${meetsPoolDifficulty ? 'Valid' : 'Invalid'}`);
-            return meetsPoolDifficulty;
-        } catch (error) {
-            console.error(`❌ Share validation error for ${miner.username}:`, error.message);
-            return false;
+            return;
         }
-    }
 
-    encodeVarint(num) {
-        if (num < 0xFD) {
-            return Buffer.from([num]).toString('hex');
-        } else if (num <= 0xFFFF) {
-            return Buffer.from([0xFD, num & 0xFF, (num >> 8) & 0xFF]).toString('hex');
-        } else if (num <= 0xFFFFFFFF) {
-            return Buffer.from([0xFE, num & 0xFF, (num >> 8) & 0xFF, (num >> 16) & 0xFF, (num >> 24) & 0xFF]).toString('hex');
-        } else {
-            throw new Error('Transaction count too large for varint encoding');
+        // Validate extranonce2 length (8 hex for 4 bytes)
+        if (extranonce2.length !== miner.extranonce2Size * 2) {
+            console.log(`❌ Invalid extranonce2 length: ${extranonce2.length}, expected ${miner.extranonce2Size * 2} (value: ${extranonce2})`);
+            this.sendMessage(miner.socket, {
+                id: id,
+                result: false,
+                error: null
+            });
+            return;
         }
-    }
 
-    reconstructCoinbase(miner, extranonce2) {
-        try {
-            const job = this.currentJob;
-            
-            if (!job || !job.coinb1 || !job.coinb2 || !miner.extranonce1) {
-                throw new Error('Missing coinbase components: job, coinb1, coinb2, or extranonce1');
-            }
-            
-            // Calculate scriptSig extranonce length (extranonce1 is 4 bytes, extranonce2 is 0 if empty)
-            let scriptSigLen = miner.extranonce1.length / 2; // Bytes (4 for extranonce1)
-            if (extranonce2 && extranonce2 !== '') {
-                scriptSigLen += extranonce2.length / 2; // Add extranonce2 bytes
-            }
-            
-            // Parse coinb1: typically version (4 bytes) + input count (1 byte) + prevout (36 bytes) + scriptSigLen (1 byte) + scriptSig
-            // Remove last byte of coinb1 (scriptSigLen) and append correct length
-            let coinb1Prefix = job.coinb1.substring(0, job.coinb1.length - 2);
-            const lengthHex = scriptSigLen.toString(16).padStart(2, '0'); // e.g., '04' for 4 bytes
-            let coinbaseTx = coinb1Prefix + lengthHex + miner.extranonce1;
-            
-            // Append extranonce2 if non-empty
-            if (extranonce2 && extranonce2 !== '') {
-                coinbaseTx += extranonce2;
-            }
-            
-            // Append coinb2 (outputs, typically 1 output to pool address)
-            coinbaseTx += job.coinb2;
-            
-            // Add SegWit witness commitment (mandatory for Bitcoin Core post-2016)
-            const witnessRoot = this.calculateCorrectMerkleRoot([...job.merkleSteps, '0000000000000000000000000000000000000000000000000000000000000000']);
-            const witnessCommitment = '6a24aa21a9ed' + witnessRoot; // OP_RETURN + 36-byte commitment
-            coinbaseTx += witnessCommitment;
-            
-            // Validate hex
-            if (!/^[0-9a-fA-F]+$/.test(coinbaseTx)) {
-                throw new Error('Invalid hex format in coinbase transaction');
-            }
-            
-            console.log(`✅ Coinbase reconstructed: length=${coinbaseTx.length} chars, extranonce length=${scriptSigLen} bytes, witness=generated`);
-            return coinbaseTx;
-        } catch (error) {
-            console.error('Coinbase reconstruction error:', error.message);
-            return null;
-        }
-    }
-    buildFullBlock(header, miner, extranonce2) {
-        try {
-            const headerBuffer = Buffer.isBuffer(header) ? header : Buffer.from(header, 'hex');
-            
-            if (headerBuffer.length !== 80) {
-                throw new Error(`Invalid block header length: ${headerBuffer.length}, expected 80 bytes`);
-            }
-            
-            const transactions = this.currentJob.transactions || [];
-            const txCount = transactions.length + 1; // +1 for coinbase
-            
-            const blockParts = [];
-            
-            // Block header (80 bytes)
-            blockParts.push(headerBuffer);
-            
-            // Transaction count (varint)
-            const txCountHex = this.encodeVarint(txCount);
-            const txCountBuffer = Buffer.from(txCountHex, 'hex');
-            blockParts.push(txCountBuffer);
-            
-            // Coinbase transaction
-            const coinbaseTx = this.reconstructCoinbase(miner, extranonce2);
-            if (!coinbaseTx) {
-                throw new Error('Failed to reconstruct coinbase transaction');
-            }
-            const coinbaseBuffer = Buffer.from(coinbaseTx, 'hex');
-            blockParts.push(coinbaseBuffer);
-            
-            // Other transactions
-            for (let i = 0; i < transactions.length; i++) {
-                const tx = transactions[i];
-                if (!tx.data || !/^[0-9a-fA-F]+$/.test(tx.data)) {
-                    throw new Error(`Transaction ${i} missing or invalid data field`);
-                }
-                blockParts.push(Buffer.from(tx.data, 'hex'));
-            }
-            
-            const blockBuffer = Buffer.concat(blockParts);
-            
-            if (blockBuffer.length > 4000000) {
-                throw new Error(`Block size ${blockBuffer.length} exceeds 4MB limit`);
-            }
-            
-            const blockHex = blockBuffer.toString('hex');
-            console.log(`✅ Block constructed: size=${blockBuffer.length} bytes, tx count=${txCount}`);
-            console.log(`DEBUG Block hex (first 200 chars): ${blockHex.substring(0, 200)}...`);
-            return blockHex;
-        } catch (error) {
-            console.error('Block construction failed:', error.message);
-            return null;
-        }
-    }
+        // Log for debugging (remove after confirmation)
+        console.log(`DEBUG Share: worker=${workerName}, jobId=${jobId}, extranonce2=${extranonce2}, ntime=${ntime}, nonce=${nonce}, rolledVersion=${rolledVersion || 'none'}`);
 
-    async submitFoundBlock(blockHeader, miner, extranonce2) {
-        try {
-            console.log('Constructing complete block for submission...');
-            
-            const blockHex = this.buildFullBlock(blockHeader, miner, extranonce2);
-            
-            if (!blockHex) {
-                console.error('Failed to construct complete block - submission aborted');
-                return null;
-            }
-            
-            console.log('Submitting block to Bitcoin network...');
-            console.log(`Block size: ${blockHex.length / 2} bytes`);
-            
-            const result = await this.bitcoin.callRpc('submitblock', [blockHex]);
-            
-            if (result === null) {
-                console.log('🎉 BLOCK ACCEPTED BY BITCOIN NETWORK! 🎉');
-                console.log('Block reward (3.125 BTC + fees) will arrive at:', this.bitcoin.poolAddress);
-                
-                const blockHash = this.calculateBlockHash(blockHeader).reverse().toString('hex');
-                this.monitor.recordBlockSubmission(blockHash, this.currentJob.height, miner.id);
-                
-                const timestamp = new Date().toISOString();
-                const logEntry = `${timestamp}: BLOCK FOUND - Hash: ${blockHash}, Size: ${blockHex.length / 2} bytes\n`;
-                
-                require('fs').appendFileSync('./logs/blocks-found.log', logEntry);
-                
-            } else {
-                console.error('Block rejected by network:', result);
-                
-                const timestamp = new Date().toISOString();
-                const logEntry = `${timestamp}: BLOCK REJECTED - Reason: ${result}, Size: ${blockHex.length / 2} bytes\n`;
-                require('fs').appendFileSync('./logs/blocks-rejected.log', logEntry);
-            }
-            
-            return result;
-            
-        } catch (error) {
-            console.error('Block submission failed:', error.message);
-            return null;
-        }
-    }
+        // Build full coinbase correctly: replace spaces in coinb1/coinb2
+        const coinb1_bytes = Buffer.from(this.currentJob.coinb1, 'hex');
+        const coinb2_bytes = Buffer.from(this.currentJob.coinb2, 'hex');
 
-    buildOptimizedBlockHeader(miner, extranonce2, time, nonce, versionRolled = null) {
-        const job = this.currentJob;
-        
-        if (!job.cachedCoinbaseTemplate) {
-            job.cachedCoinbaseTemplate = Buffer.concat([
-                Buffer.from(job.coinb1, 'hex'),
-                Buffer.from(miner.extranonce1, 'hex')
-            ]);
-        }
-        
+        // coinb1 ends with extranonce1 space (4 zero bytes) - slice it out
+        const coinb1_prefix = coinb1_bytes.slice(0, -this.extranonce1Size);
+
+        // coinb2 starts with extranonce2 space (4 zero bytes) - slice it out
+        const coinb2_suffix = coinb2_bytes.slice(this.extranonce2Size);
+
+        // Actual extranonce bytes
+        const extranonce1_bytes = Buffer.from(miner.extranonce1, 'hex');
+        const extranonce2_bytes = Buffer.from(extranonce2, 'hex');
+
+        // Full coinbase: prefix1 + extranonce1 + extranonce2 + suffix2
         const coinbase = Buffer.concat([
-            job.cachedCoinbaseTemplate,
-            Buffer.from(extranonce2, 'hex'),
-            Buffer.from(job.coinb2, 'hex')
+            coinb1_prefix,
+            extranonce1_bytes,
+            extranonce2_bytes,
+            coinb2_suffix
         ]);
-        
-        const coinbaseHash = this.doublesha256(coinbase);
-        const merkleRoot = this.calculateCorrectMerkleRoot(coinbaseHash.toString('hex'), job.merkleSteps || []);
-        console.log(`DEBUG Merkle: coinbaseHash=${coinbaseHash.toString('hex').substring(0, 16)}..., root=${merkleRoot.substring(0, 16)}...`);
-        
+
+        const coinbaseHash = this.doublesha256(coinbase); // LE bytes
+        const merkleRoot = this.calculateCorrectMerkleRoot(coinbaseHash.reverse().toString('hex'), this.currentJob.merkleSteps || []); // BE hex for merkle
+
+        // Build header with rolled version
+        const header = this.buildOptimizedBlockHeader(this.currentJob, miner, merkleRoot, ntime, nonce, rolledVersion);
+        const blockHash = this.calculateBlockHash(header); // LE bytes
+        const processingTime = Date.now() - startTime;
+
+        // Check difficulties
+        const target = this.difficultyToTarget(miner.difficulty); // BE bytes
+        const meetsPoolDiff = this.meetsTarget(blockHash, target); // Compares reversed (BE hash) <= BE target
+        const meetsNetworkDiff = this.meetsTarget(blockHash, Buffer.from(this.currentJob.target, 'hex'));
+
+        // Log validation for debugging (remove after confirmation)
+        const beHash = blockHash.reverse().toString('hex');
+        const beTarget = target.toString('hex');
+        console.log(`DEBUG Validation: coinbase_len=${coinbase.length}, merkle=${merkleRoot.substring(0, 16)}..., hash=${blockHash.reverse().toString('hex').substring(0, 16)}..., target=${target.toString('hex').substring(0, 16)}..., meetsPool=${meetsPoolDiff}, meetsNetwork=${meetsNetworkDiff}`);
+
+        // Queue for batch processing
+        this.shareQueue.push({
+            minerId,
+            jobId,
+            nonce,
+            isValid: meetsPoolDiff,
+            meetsPoolDiff,
+            meetsNetworkDiff,
+            blockHash: blockHash.toString('hex'),
+            processingTime
+        });
+
+        // Immediate response to miner
+        this.sendMessage(miner.socket, {
+            id: id,
+            result: meetsPoolDiff,
+            error: null
+        });
+
+        // Update miner stats
+        miner.shareCount++;
+        if (meetsPoolDiff) {
+            miner.validShares++;
+            this.emit('validShare', { miner, nonce });
+            console.log(`💎 Valid share: ${miner.username} found nonce ${nonce}`);
+        }
+
+        if (meetsNetworkDiff) {
+            console.log(`🎉 BLOCK FOUND! Submitting block for ${miner.username}`);
+            this.submitFoundBlock(miner, header, coinbase, this.currentJob.transactions || []);
+        }
+
+        // Adjust difficulty periodically
+        this.adjustMinerDifficulty(miner);
+    }
+
+    handleDisconnect(minerId) {
+        const miner = this.miners.get(minerId);
+        if (!miner) return;
+
+        const duration = Date.now() - miner.connectTime;
+        console.log(`🔌 CONNECTION CLOSED: ${miner.address} (${minerId.substring(0, 8)})`);
+        console.log(`   Duration: ${duration}ms`);
+        console.log(`   Subscribed: ${miner.subscribed}`);
+        console.log(`   Authorized: ${miner.authorized}`);
+        console.log(`   Shares: ${miner.shareCount}`);
+
+        // Log disconnection to DB
+        this.db.logMinerDisconnection(minerId).catch(err => {
+            console.error(`❌ Failed to log miner disconnection for ${minerId}: ${err.message}`);
+        });
+
+        // Clear keepalive interval
+        if (miner.keepaliveInterval) {
+            clearInterval(miner.keepaliveInterval);
+        }
+
+        this.miners.delete(minerId);
+        this.monitor.recordMinerDisconnection(minerId);
+    }
+
+    buildOptimizedBlockHeader(job, miner, merkleRoot, time, nonce, rolledVersion = null) {
+        // Use submitted rolled version if provided (version-rolling)
+        let version;
+        if (miner.supportsVersionRolling && rolledVersion) {
+            const baseVersion = parseInt(job.version, 16);
+            const rolledBits = parseInt(rolledVersion, 16);
+            version = baseVersion | (rolledBits & parseInt(miner.rollingMask, 16));
+            console.log(`DEBUG Version rolling: base=${baseVersion.toString(16)}, rolled=${rolledVersion}, mask=${miner.rollingMask}, final=${version.toString(16)}`);
+        } else {
+            version = parseInt(job.version, 16);
+        }
+
         const header = Buffer.alloc(80);
         let offset = 0;
         
-        // Version: LE, apply version rolling
-        const version = versionRolled ? (parseInt(job.version, 16) | (parseInt(versionRolled, 16) & parseInt(miner.rollingMask, 16))) : parseInt(job.version, 16);
+        // Version: LE
         header.writeUInt32LE(version, offset);
-        console.log(`DEBUG Header: version=0x${version.toString(16).padStart(8, '0')} (LE)`);
         offset += 4;
         
-        // Prev block hash: LE bytes (job.prevHash is already reversed hex)
+        // Prev block hash: LE (job.prevHash is reversed hex from getBlockTemplate)
         const prevHashBuf = Buffer.from(job.prevHash, 'hex');
         prevHashBuf.copy(header, offset);
-        console.log(`DEBUG Header: prevHash=${job.prevHash.substring(0, 16)}... (LE)`);
         offset += 32;
         
-        // Merkle root: LE bytes (root is BE hex, reverse for header)
+        // Merkle root: LE (reverse BE hex for header)
         Buffer.from(merkleRoot, 'hex').reverse().copy(header, offset);
-        console.log(`DEBUG Header: merkleRoot=${merkleRoot.substring(0, 16)}... (BE, reversed to LE)`);
         offset += 32;
         
         // Timestamp: LE
         header.writeUInt32LE(parseInt(time, 16), offset);
-        console.log(`DEBUG Header: time=0x${time} (LE)`);
         offset += 4;
         
         // Difficulty bits: LE
         header.writeUInt32LE(parseInt(job.nbits, 16), offset);
-        console.log(`DEBUG Header: nbits=${job.nbits} (LE)`);
         offset += 4;
         
         // Nonce: LE
         header.writeUInt32LE(parseInt(nonce, 16), offset);
-        console.log(`DEBUG Header: nonce=0x${nonce} (LE)`);
         
-        console.log(`DEBUG Constructed header: ${header.toString('hex').substring(0, 80)}...`);
+        console.log(`DEBUG Header: version=${version.toString(16)}, prevHash=${job.prevHash.substring(0, 16)}..., merkle=${merkleRoot.substring(0, 16)}..., ntime=${parseInt(time, 16).toString(16)}, nbits=${job.nbits}, nonce=${parseInt(nonce, 16).toString(16)}`);
         return header;
+    }
+
+    async submitFoundBlock(miner, header, coinbase, transactions) {
+        try {
+            // Build full block
+            const txCount = this.varintEncode(transactions.length + 1); // +1 for coinbase
+            const txData = Buffer.concat([
+                txCount,
+                coinbase,
+                ...transactions.map(tx => Buffer.from(tx.data, 'hex'))
+            ]);
+            
+            const blockHex = Buffer.concat([
+                header,
+                txData
+            ]).toString('hex');
+            
+            const result = await this.bitcoin.submitBlock(blockHex);
+            if (result) {
+                console.log(`🎉 BLOCK ACCEPTED! Hash: ${this.calculateBlockHash(header).toString('hex').reverse().toString('hex')}`);
+                this.db.logBlockFound(miner.id, this.calculateBlockHash(header).toString('hex'), this.currentJob.height);
+                this.emit('blockFound', { miner, blockHash: result });
+            } else {
+                console.log(`❌ Block rejected: ${result}`);
+            }
+        } catch (error) {
+            console.error(`❌ Error submitting block: ${error.message}`);
+        }
+    }
+
+    varintEncode(num) {
+        if (num < 0xfd) {
+            return Buffer.from([num]);
+        } else if (num <= 0xffff) {
+            const buf = Buffer.alloc(3);
+            buf[0] = 0xfd;
+            buf.writeUInt16LE(num, 1);
+            return buf;
+        } else if (num <= 0xffffffff) {
+            const buf = Buffer.alloc(5);
+            buf[0] = 0xfe;
+            buf.writeUInt32LE(num, 1);
+            return buf;
+        } else {
+            const buf = Buffer.alloc(9);
+            buf[0] = 0xff;
+            buf.writeBigUInt64LE(BigInt(num), 1);
+            return buf;
+        }
     }
 
     calculateBlockHash(header) {
@@ -903,25 +699,22 @@ class RealStratumServer extends EventEmitter {
     }
 
     doublesha256(data) {
-        const crypto = require('crypto');
         const hash1 = crypto.createHash('sha256').update(data).digest();
         const hash2 = crypto.createHash('sha256').update(hash1).digest();
         return hash2;
     }
 
     calculateCorrectMerkleRoot(coinbaseHashHex, merkleSteps) {
+        let root = coinbaseHashHex; // BE hex
         if (!merkleSteps || merkleSteps.length === 0) {
-            console.log(`DEBUG Merkle: No steps, using coinbaseHash=${coinbaseHashHex.substring(0, 16)}...`);
-            return coinbaseHashHex;
+            return root;
         }
-        let root = coinbaseHashHex;
         for (let i = 0; i < merkleSteps.length; i++) {
-            const left = Buffer.from(root, 'hex').reverse(); // LE for hashing
-            const right = Buffer.from(merkleSteps[i], 'hex').reverse(); // LE
+            const left = Buffer.from(root, 'hex').reverse(); // To LE for hashing
+            const right = Buffer.from(merkleSteps[i], 'hex').reverse(); // To LE
             const combined = Buffer.concat([left, right]);
-            const hash = this.doublesha256(combined);
-            root = hash.reverse().toString('hex'); // BE hex for Stratum
-            console.log(`DEBUG Merkle step ${i}: left=${left.toString('hex').substring(0, 16)}..., right=${right.toString('hex').substring(0, 16)}..., root=${root.substring(0, 16)}...`);
+            const hash = this.doublesha256(combined); // LE hash
+            root = hash.reverse().toString('hex'); // Back to BE hex
         }
         return root;
     }
@@ -930,7 +723,7 @@ class RealStratumServer extends EventEmitter {
         setInterval(async () => {
             console.log(`🕒 Batch processor tick, queue size: ${this.shareQueue.length}`);
             if (this.shareQueue.length > 0) {
-                const batch = this.shareQueue.splice(0, 5000); // Handle 500 TH/s
+                const batch = this.shareQueue.splice(0, 5000); // Handle high hashrate
                 console.log(`📦 Processing batch of ${batch.length} shares...`);
                 try {
                     const validShares = batch.filter(s => s.isValid).length;
@@ -969,7 +762,7 @@ class RealStratumServer extends EventEmitter {
     }
 
     sendJob(miner) {
-        if (!this.currentJob || !miner.subscribed) return;
+        if (!this.currentJob || !miner.subscribed || !miner.authorized) return;
 
         const message = {
             id: null,
@@ -979,11 +772,11 @@ class RealStratumServer extends EventEmitter {
                 this.currentJob.prevHash,
                 this.currentJob.coinb1,
                 this.currentJob.coinb2,
-                this.currentJob.merkleSteps,
+                this.currentJob.merkleSteps || [],
                 this.currentJob.version,
                 this.currentJob.nbits,
                 this.currentJob.ntime,
-                true
+                true // Clean jobs
             ]
         };
         this.sendMessage(miner.socket, message);
@@ -992,23 +785,25 @@ class RealStratumServer extends EventEmitter {
     broadcastJob(jobData) {
         this.currentJob = jobData;
         
+        let broadcastCount = 0;
         for (const [minerId, miner] of this.miners) {
             if (miner.subscribed && miner.authorized) {
                 this.sendJob(miner);
+                broadcastCount++;
             }
         }
         
-        console.log(`Broadcasted job ${jobData.jobId} to ${this.miners.size} miners`);
+        console.log(`Broadcasted job ${jobData.jobId} to ${broadcastCount} miners`);
     }
 
     sendMessage(socket, message) {
         try {
             if (socket && socket.writable && !socket.destroyed) {
                 const data = JSON.stringify(message) + '\n';
-                console.log(`📤 SENDING:`, JSON.stringify(message));
+                console.log(`📤 SENDING: ${JSON.stringify(message)}`);
                 socket.write(data, (err) => {
                     if (err) {
-                        console.log(`❌ Write error: ${err.message}`);
+                        console.error(`❌ Write error: ${err.message}`);
                         socket.destroy();
                     } else {
                         console.log(`✅ Message sent successfully`);
