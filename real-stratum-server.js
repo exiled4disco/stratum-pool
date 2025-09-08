@@ -173,16 +173,16 @@ class RealStratumServer extends EventEmitter {
         
         if (timeSinceLastAdjust < 60000) return;
         
-        const targetSharesPerMinute = 10; // Higher for S9, faster ramp
+        const targetSharesPerMinute = 6; // ~6 shares/min per miner
         const timeWindowMinutes = Math.min(timeSinceLastAdjust / 60000, 10);
         const actualSharesPerMinute = (miner.validShares || 0) / timeWindowMinutes;
         
         let newDifficulty = miner.difficulty;
         
         if (actualSharesPerMinute > targetSharesPerMinute * 1.5) {
-            newDifficulty = miner.difficulty * 2; // No cap
+            newDifficulty = miner.difficulty * 2;
         } else if (actualSharesPerMinute < targetSharesPerMinute * 0.5 && miner.validShares > 5) {
-            newDifficulty = Math.max(miner.difficulty * 0.5, 0.00001);
+            newDifficulty = Math.max(miner.difficulty * 0.5, 0.001);
         }
         
         if (Math.abs(newDifficulty - miner.difficulty) / miner.difficulty > 0.1) {
@@ -361,7 +361,7 @@ class RealStratumServer extends EventEmitter {
         miner.subscribed = true;
         miner.subscriptionId = subscriptionId;
         miner.extranonce1 = extranonce1;
-        miner.difficulty = 0.000001; // Ultra-low to force valids in ~50–100 shares
+        miner.difficulty = 0.001; // Initial difficulty for S9 (~1 valid every ~40s)
         miner.shareCount = 0;
         miner.validShares = 0;
         miner.lastDifficultyAdjust = Date.now();
@@ -374,7 +374,7 @@ class RealStratumServer extends EventEmitter {
                     ["mining.notify", subscriptionId]
                 ],
                 extranonce1,
-                0 // No miner-side extranonce2, server handles coinbase variation
+                0 // No miner-side extranonce2
             ],
             error: null
         };
@@ -386,7 +386,7 @@ class RealStratumServer extends EventEmitter {
             this.sendJob(miner);
         }
 
-        // Periodic job refresh to prevent miner timeout
+        // Periodic job refresh to prevent timeout
         setInterval(() => {
             if (miner.subscribed && miner.authorized && this.currentJob && miner.socket.writable && !miner.socket.destroyed) {
                 this.sendJob(miner);
@@ -473,7 +473,6 @@ class RealStratumServer extends EventEmitter {
             const version = parseInt(versionRolled, 16);
             const baseVersion = parseInt(this.currentJob.version, 16);
             const mask = parseInt(miner.rollingMask || '1fffe000', 16);
-            // Relaxed check for Braiins OS compatibility
             if ((version & ~mask) !== (baseVersion & ~mask)) {
                 console.log(`⚠️ Version rolling mismatch (relaxed accept): ${versionRolled} (base: ${this.currentJob.version}, mask: ${miner.rollingMask})`);
             } else {
@@ -486,14 +485,8 @@ class RealStratumServer extends EventEmitter {
             const blockHeader = this.buildOptimizedBlockHeader(miner, extranonce2, time, nonce, versionRolled);
             const hash = this.calculateBlockHash(blockHeader);
             
-            // Pool difficulty check with fixed endianness comparison
-            let poolTarget;
-            if (miner.difficulty < 0.000015) {
-                // Cap to maximum target for very low difficulty (all hashes pass for testing)
-                poolTarget = Buffer.alloc(32, 0xff); // ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
-            } else {
-                poolTarget = this.difficultyToTarget(miner.difficulty);
-            }
+            // Pool difficulty check with real target
+            const poolTarget = this.difficultyToTarget(miner.difficulty);
             
             // Reverse both hash and target for little-endian comparison
             const reversedHash = Buffer.from(hash).reverse();
@@ -514,11 +507,13 @@ class RealStratumServer extends EventEmitter {
                 const reversedNetworkTarget = networkTarget.reverse();
                 meetsNetworkDifficulty = reversedHash.compare(reversedNetworkTarget) <= 0;
                 
-                if (meetsNetworkDifficulty) {
+                if (meetsNetworkDifficulty && miner.difficulty >= 0.001) {
                     console.log('🎉 BLOCK FOUND!');
                     const blockHash = reversedHash.toString('hex');
                     await this.db.logBlockFound(miner.id, blockHash, this.currentJob.height);
                     await this.submitFoundBlock(blockHeader, miner, extranonce2);
+                } else if (meetsNetworkDifficulty) {
+                    console.log('⚠️ Ignoring block find at low difficulty (false positive)');
                 }
             }
             
@@ -559,42 +554,41 @@ class RealStratumServer extends EventEmitter {
         try {
             const job = this.currentJob;
             
-            if (!job.coinb1 || !job.coinb2 || !miner.extranonce1) {
-                throw new Error('Missing coinbase components: coinb1, coinb2, or extranonce1');
+            if (!job || !job.coinb1 || !job.coinb2 || !miner.extranonce1) {
+                throw new Error('Missing coinbase components: job, coinb1, coinb2, or extranonce1');
             }
             
-            let totalExtranonceLength = miner.extranonce1.length / 2; // Hex chars to bytes
-            
-            // Append extranonce2 length if non-empty
+            // Calculate scriptSig extranonce length (extranonce1 is 4 bytes, extranonce2 is 0 if empty)
+            let scriptSigLen = miner.extranonce1.length / 2; // Bytes (4 for extranonce1)
             if (extranonce2 && extranonce2 !== '') {
-                totalExtranonceLength += extranonce2.length / 2;
+                scriptSigLen += extranonce2.length / 2; // Add extranonce2 bytes
             }
             
-            // Adjust coinb1 length prefix (last byte of coinb1 is typically the push length for extranonce)
-            let adjustedCoinb1 = job.coinb1.substring(0, job.coinb1.length - 2); // Remove last 2 hex chars (1 byte length)
-            const lengthHex = totalExtranonceLength.toString(16).padStart(2, '0'); // e.g., '04' for 4 bytes
-            adjustedCoinb1 += lengthHex;
-            
-            let coinbaseTx = adjustedCoinb1 + miner.extranonce1;
+            // Parse coinb1: typically version (4 bytes) + input count (1 byte) + prevout (36 bytes) + scriptSigLen (1 byte) + scriptSig
+            // Remove last byte of coinb1 (scriptSigLen) and append correct length
+            let coinb1Prefix = job.coinb1.substring(0, job.coinb1.length - 2);
+            const lengthHex = scriptSigLen.toString(16).padStart(2, '0'); // e.g., '04' for 4 bytes
+            let coinbaseTx = coinb1Prefix + lengthHex + miner.extranonce1;
             
             // Append extranonce2 if non-empty
             if (extranonce2 && extranonce2 !== '') {
                 coinbaseTx += extranonce2;
             }
             
+            // Append coinb2 (outputs, typically 1 output to pool address)
             coinbaseTx += job.coinb2;
             
-            // Add witness commitment if present
-            if (job.default_witness_commitment) {
-                coinbaseTx += job.default_witness_commitment;
-            }
+            // Add SegWit witness commitment (mandatory for Bitcoin Core post-2016)
+            const witnessRoot = this.calculateCorrectMerkleRoot([...job.merkleSteps, '0000000000000000000000000000000000000000000000000000000000000000']);
+            const witnessCommitment = '6a24aa21a9ed' + witnessRoot; // OP_RETURN + 36-byte commitment
+            coinbaseTx += witnessCommitment;
             
-            // Validate final hex
+            // Validate hex
             if (!/^[0-9a-fA-F]+$/.test(coinbaseTx)) {
                 throw new Error('Invalid hex format in coinbase transaction');
             }
             
-            console.log(`✅ Coinbase reconstructed: length=${coinbaseTx.length} chars, total extranonce length=${totalExtranonceLength} bytes`);
+            console.log(`✅ Coinbase reconstructed: length=${coinbaseTx.length} chars, extranonce length=${scriptSigLen} bytes, witness=generated`);
             return coinbaseTx;
         } catch (error) {
             console.error('Coinbase reconstruction error:', error.message);
@@ -627,13 +621,14 @@ class RealStratumServer extends EventEmitter {
             if (!coinbaseTx) {
                 throw new Error('Failed to reconstruct coinbase transaction');
             }
-            blockParts.push(Buffer.from(coinbaseTx, 'hex'));
+            const coinbaseBuffer = Buffer.from(coinbaseTx, 'hex');
+            blockParts.push(coinbaseBuffer);
             
             // Other transactions
             for (let i = 0; i < transactions.length; i++) {
                 const tx = transactions[i];
-                if (!tx.data) {
-                    throw new Error(`Transaction ${i} missing data field`);
+                if (!tx.data || !/^[0-9a-fA-F]+$/.test(tx.data)) {
+                    throw new Error(`Transaction ${i} missing or invalid data field`);
                 }
                 blockParts.push(Buffer.from(tx.data, 'hex'));
             }
@@ -644,8 +639,10 @@ class RealStratumServer extends EventEmitter {
                 throw new Error(`Block size ${blockBuffer.length} exceeds 4MB limit`);
             }
             
+            const blockHex = blockBuffer.toString('hex');
             console.log(`✅ Block constructed: size=${blockBuffer.length} bytes, tx count=${txCount}`);
-            return blockBuffer.toString('hex');
+            console.log(`DEBUG Block hex (first 200 chars): ${blockHex.substring(0, 200)}...`);
+            return blockHex;
         } catch (error) {
             console.error('Block construction failed:', error.message);
             return null;
@@ -788,7 +785,7 @@ class RealStratumServer extends EventEmitter {
         setInterval(async () => {
             console.log(`🕒 Batch processor tick, queue size: ${this.shareQueue.length}`);
             if (this.shareQueue.length > 0) {
-                const batch = this.shareQueue.splice(0, 100);
+                const batch = this.shareQueue.splice(0, 1000); // Handle 500 TH/s
                 console.log(`📦 Processing batch of ${batch.length} shares...`);
                 try {
                     const validShares = batch.filter(s => s.isValid).length;
