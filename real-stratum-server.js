@@ -287,28 +287,20 @@ class RealStratumServer extends EventEmitter {
     handleData(minerId, data) {
         const miner = this.miners.get(minerId);
         if (!miner) return;
-
-        miner.lastActivity = Date.now();
-        
-        // DEBUG: Log all incoming data
-        console.log(`📥 RAW DATA from ${miner.address}:`, data.toString().trim());
-        
-        const messages = data.toString().trim().split('\n');
-        
+        const messages = data.toString().split('\n').filter(msg => msg.trim());
         for (const messageStr of messages) {
-            if (!messageStr.trim() || !messageStr.startsWith('{')) continue; // Skip non-JSON
-            
+            console.log(`📥 RAW DATA from ${miner.address}: ${messageStr}`);
             try {
                 const message = JSON.parse(messageStr);
-                console.log(`📨 PARSED MESSAGE from ${miner.address}:`, JSON.stringify(message));
-                this.processMessage(minerId, message);
+                console.log(`📨 PARSED MESSAGE from ${miner.address}: ${JSON.stringify(message)}`);
+                this.processMessage(minerId, message); // Add this line
             } catch (err) {
-                console.log(`⚠️ JSON PARSE ERROR from ${miner.address}:`, err.message);
-                console.log(`⚠️ FAILED MESSAGE:`, messageStr);
-                continue;
+                console.log(`⚠️ JSON/RUNTIME ERROR from ${miner.address}: ${err.message}`);
             }
         }
     }
+
+// Then utility methods like difficultyToTarget
 
     processMessage(minerId, message) {
         const miner = this.miners.get(minerId);
@@ -325,7 +317,6 @@ class RealStratumServer extends EventEmitter {
                 console.log(`🔧 Handling mining.configure from ${miner.address}: extensions=${JSON.stringify(params)}`);
                 const extensions = params && params[0] ? params[0] : [];
                 const config = params && params[1] ? params[1] : {};
-
                 let supportedExtensions = [];
                 miner.supportsVersionRolling = false;
 
@@ -333,55 +324,39 @@ class RealStratumServer extends EventEmitter {
                     miner.rollingMask = config['version-rolling'].mask || '1fffe000';
                     miner.minBitCount = config['version-rolling']['min-bit-count'] || 16;
                     miner.supportsVersionRolling = true;
-                    supportedExtensions = [
-                        ['version-rolling', {
-                            'mask': miner.rollingMask,
-                            'min-bit-count': miner.minBitCount
-                        }]
-                    ];
+                    supportedExtensions = [['version-rolling', { 'mask': miner.rollingMask, 'min-bit-count': miner.minBitCount }]];
                     console.log(`✅ Version-rolling enabled for ${miner.address}: mask=${miner.rollingMask}, min-bits=${miner.minBitCount}`);
                 }
 
-                const configureResponse = {
+                this.sendMessage(miner.socket, {
                     id: id,
                     result: [supportedExtensions, config],
                     error: null
-                };
-                this.sendMessage(miner.socket, configureResponse);
+                });
                 break;
 
             case 'mining.subscribe':
                 console.log(`🔄 PROCESSING mining.subscribe from ${miner.address}`);
                 const subscriptionId = crypto.randomBytes(4).toString('hex');
                 const extranonce1 = crypto.randomBytes(4).toString('hex');
-                const extranonce2Size = 4; // Matches BitcoinConnector config
+                const extranonce2Size = 4;
 
                 miner.subscribed = true;
                 miner.subscriptionId = subscriptionId;
                 miner.extranonce1 = extranonce1;
                 miner.extranonce2Size = extranonce2Size;
-                miner.difficulty = 0.001; // Initial diff for ~13 TH/s ASIC (~1 share/111ms)
+                miner.difficulty = 0.001;
                 miner.shareCount = 0;
                 miner.validShares = 0;
                 miner.lastDifficultyAdjust = Date.now();
 
-                const subscribeResponse = {
+                this.sendMessage(miner.socket, {
                     id: id,
-                    result: [
-                        [
-                            ["mining.set_difficulty", subscriptionId],
-                            ["mining.notify", subscriptionId]
-                        ],
-                        extranonce1,
-                        extranonce2Size
-                    ],
+                    result: [[["mining.set_difficulty", subscriptionId], ["mining.notify", subscriptionId]], extranonce1, extranonce2Size],
                     error: null
-                };
-                this.sendMessage(miner.socket, subscribeResponse);
+                });
                 this.sendDifficulty(miner);
-                if (this.currentJob) {
-                    this.sendJob(miner);
-                }
+                if (this.currentJob) this.sendJob(miner);
                 console.log(`✅ Subscribed ${miner.address}: subscriptionId=${subscriptionId}, extranonce1=${extranonce1}`);
                 this.monitor.recordMinerConnection(minerId, miner.username || 'unknown', miner.address);
                 break;
@@ -395,17 +370,14 @@ class RealStratumServer extends EventEmitter {
                 miner.username = username;
                 miner.lastActivity = Date.now();
 
-                const authorizeResponse = {
+                this.sendMessage(miner.socket, {
                     id: id,
                     result: true,
                     error: null
-                };
-                this.sendMessage(miner.socket, authorizeResponse);
+                });
                 console.log(`✅ Authorized ${miner.address} as ${username}`);
                 this.db.logMinerConnection(minerId, username, miner.address);
-                if (this.currentJob) {
-                    this.sendJob(miner);
-                }
+                if (this.currentJob) this.sendJob(miner);
                 break;
 
             case 'mining.submit':
@@ -440,7 +412,7 @@ class RealStratumServer extends EventEmitter {
 
                 const meetsPoolDiff = this.meetsTarget(blockHash, poolTarget);
                 const meetsNetworkDiff = this.meetsTarget(blockHash, networkTarget);
-                const isValid = meetsPoolDiff; // Valid if meets pool difficulty
+                const isValid = meetsPoolDiff;
 
                 miner.validShares += isValid ? 1 : 0;
                 this.adjustMinerDifficulty(miner);
@@ -457,28 +429,18 @@ class RealStratumServer extends EventEmitter {
                 };
                 this.shareQueue.push(shareData);
 
-                this.db.logShare(
-                    minerId,
-                    jobId,
-                    nonce,
-                    isValid,
-                    meetsPoolDiff,
-                    meetsNetworkDiff,
-                    blockHash,
-                    processingTime
-                );
+                this.db.logShare(minerId, jobId, nonce, isValid, meetsPoolDiff, meetsNetworkDiff, blockHash, processingTime);
 
                 if (meetsNetworkDiff) {
                     console.log(`🎉 BLOCK CANDIDATE FOUND by ${miner.address}: hash=${blockHash}`);
                     this.submitFoundBlock(header, miner, extranonce2);
                 }
 
-                const submitResponse = {
+                this.sendMessage(miner.socket, {
                     id: id,
                     result: isValid,
                     error: isValid ? null : [22, 'Share rejected - low difficulty', null]
-                };
-                this.sendMessage(miner.socket, submitResponse);
+                });
                 console.log(`💎 Share processed for ${miner.address}: valid=${isValid}, meetsNetworkDiff=${meetsNetworkDiff}`);
                 this.emit('validShare', { miner, nonce, blockHash });
                 break;
