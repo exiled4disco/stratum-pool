@@ -320,17 +320,17 @@ class RealStratumServer extends EventEmitter {
                 let supportedExtensions = [];
                 miner.supportsVersionRolling = false;
 
-                if (extensions.includes('version-rolling') && config['version-rolling']) {
+                if (extensions.includes('version-rolling') && config['version-rolling']) {  // <-- BUG HERE
                     miner.rollingMask = config['version-rolling'].mask || '1fffe000';
                     miner.minBitCount = config['version-rolling']['min-bit-count'] || 16;
                     miner.supportsVersionRolling = true;
-                    supportedExtensions = [['version-rolling', { 'mask': miner.rollingMask, 'min-bit-count': miner.minBitCount }]];
+                    supportedExtensions = [['version-rolling', { 'mask': miner.rollingMask, 'min-bit-count': miner.minBitCount }]];  // <-- Also incorrect format
                     console.log(`✅ Version-rolling enabled for ${miner.address}: mask=${miner.rollingMask}, min-bits=${miner.minBitCount}`);
                 }
 
                 this.sendMessage(miner.socket, {
                     id: id,
-                    result: [supportedExtensions, config],
+                    result: [supportedExtensions, config],  // Results in [[], config] due to failed condition
                     error: null
                 });
                 break;
