@@ -139,9 +139,6 @@ class RealStratumServer extends EventEmitter {
         });
     }
 
-    /**
-     * Convert difficulty to target value
-     */
     difficultyToTarget(difficulty) {
         console.log(`🔧 difficultyToTarget called with: ${difficulty}`);
         
@@ -149,22 +146,24 @@ class RealStratumServer extends EventEmitter {
             difficulty = 0.00001;
         }
         
-        // Bitcoin's maximum target (difficulty 1) - this is the correct value
+        // Bitcoin's maximum target (difficulty 1) - exact value from Bitcoin Core
         const maxTarget = BigInt('0x00000000FFFF0000000000000000000000000000000000000000000000000000');
         
-        // Convert difficulty to BigInt for precise calculation
-        const difficultyBig = BigInt(Math.floor(difficulty * 1000000)) / BigInt(1000000);
-        
         let targetBig;
+        
         if (difficulty >= 1.0) {
             // For difficulty >= 1: target = maxTarget / difficulty
-            targetBig = maxTarget / BigInt(Math.floor(difficulty));
+            // Use floor to match Bitcoin Core behavior
+            const difficultyFloor = BigInt(Math.floor(difficulty));
+            targetBig = maxTarget / difficultyFloor;
         } else {
-            // For difficulty < 1: target = maxTarget / difficulty (will be larger than maxTarget)
-            const scaledDiff = Math.floor(difficulty * 1000000);
-            targetBig = (maxTarget * BigInt(1000000)) / BigInt(scaledDiff);
+            // For difficulty < 1: target = maxTarget / difficulty (result will be larger than maxTarget)
+            // Use precise calculation with scaling to avoid floating point errors
+            const scale = BigInt(1000000000); // 1 billion for precision
+            const difficultyScaled = BigInt(Math.round(difficulty * Number(scale)));
+            targetBig = (maxTarget * scale) / difficultyScaled;
             
-            // Cap at maximum possible value
+            // Ensure we don't exceed maximum 256-bit value
             const maxUint256 = (BigInt(1) << BigInt(256)) - BigInt(1);
             if (targetBig > maxUint256) {
                 targetBig = maxUint256;
@@ -179,17 +178,23 @@ class RealStratumServer extends EventEmitter {
     }
 
     /**
-     * Check if hash meets target difficulty (fixed implementation)
+     * Check if hash meets target difficulty (proper endianness handling)
      */
     meetsTarget(hash, target) {
-        // Convert hash to big-endian for comparison
+        // Hash comes in as little-endian bytes from SHA256
+        // Target is stored as big-endian bytes
+        // For comparison, we need both in the same endianness
+        
+        // Convert little-endian hash to big-endian for comparison
         const hashBE = Buffer.from(hash).reverse();
         
-        // Compare as big-endian: hash <= target means valid
+        // Target is already big-endian, so compare directly
         const result = hashBE.compare(target) <= 0;
         
         if (result) {
-            console.log(`✅ Hash meets target: ${hashBE.toString('hex').substring(0, 16)}... <= ${target.toString('hex').substring(0, 16)}...`);
+            console.log(`✅ Valid share: hash ${hashBE.toString('hex').substring(0, 16)}... <= target ${target.toString('hex').substring(0, 16)}...`);
+        } else {
+            console.log(`❌ Invalid share: hash ${hashBE.toString('hex').substring(0, 16)}... > target ${target.toString('hex').substring(0, 16)}...`);
         }
         
         return result;
@@ -376,7 +381,7 @@ class RealStratumServer extends EventEmitter {
         miner.subscriptionId = subscriptionId;
         miner.extranonce1 = crypto.randomBytes(extranonce1Size).toString('hex');
         miner.extranonce2Size = extranonce2Size; // Store for validation
-        miner.difficulty = 1; // Temporary for testing S9 (~14 TH/s, ~400 shares/s, ~12 valid/s)
+        miner.difficulty = 0.00001; // Temporary for testing S9 (~14 TH/s, ~400 shares/s, ~12 valid/s)
         miner.shareCount = 0;
         miner.validShares = 0;
         miner.lastDifficultyAdjust = Date.now();
