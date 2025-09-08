@@ -15,6 +15,7 @@ class RealStratumServer extends EventEmitter {
             ...config
         };
        
+        this.extranonce1Size = 4;
         this.miners = new Map();
         this.server = net.createServer();
         this.jobCounter = 0;
@@ -232,6 +233,10 @@ class RealStratumServer extends EventEmitter {
         this.miners.set(minerId, miner);
         console.log(`🔗 NEW CONNECTION: ${miner.address} (${minerId.substring(0, 8)})`);
 
+        this.db.logMinerConnection(minerId, miner.username, miner.address).catch(err => {
+            console.error(`❌ Failed to log miner connection for ${minerId}: ${err.message}`);
+        });
+
         this.monitor.recordMinerConnection(minerId, 'new-connection', socket.remoteAddress);
         
         // Increase timeout for debugging
@@ -317,68 +322,77 @@ class RealStratumServer extends EventEmitter {
                 console.log(`🔧 Handling mining.configure from ${miner.address}: extensions=${JSON.stringify(params)}`);
                 const extensions = params && params[0] ? params[0] : [];
                 const config = params && params[1] ? params[1] : {};
-                let supportedExtensions = [];
                 miner.supportsVersionRolling = false;
 
-                if (extensions.includes('version-rolling') && config['version-rolling']) {  // <-- BUG HERE
-                    miner.rollingMask = config['version-rolling'].mask || '1fffe000';
-                    miner.minBitCount = config['version-rolling']['min-bit-count'] || 16;
+                const resultObj = {};  // Object/map for BIP-310 compliance
+
+                if (extensions.includes('version-rolling')) {
+                    const mask = config['version-rolling.mask'] || '1fffe000';
+                    const minBitCount = parseInt(config['version-rolling.min-bit-count']) || 16;
+                    miner.rollingMask = mask;
+                    miner.minBitCount = minBitCount;
                     miner.supportsVersionRolling = true;
-                    supportedExtensions = [['version-rolling', { 'mask': miner.rollingMask, 'min-bit-count': miner.minBitCount }]];  // <-- Also incorrect format
-                    console.log(`✅ Version-rolling enabled for ${miner.address}: mask=${miner.rollingMask}, min-bits=${miner.minBitCount}`);
+                    resultObj['version-rolling'] = true;  // Confirm support
+                    resultObj['version-rolling.mask'] = mask;  // Echo mask (adjust if needed, e.g., bitwise AND with server mask)
+                    resultObj['version-rolling.min-bit-count'] = minBitCount;  // Echo for diagnostics
+                    console.log(`✅ Version-rolling enabled for ${miner.address}: mask=${mask}, min-bits=${minBitCount}`);
+                } else {
+                    // If no extensions or unsupported, set false for requested ones
+                    for (const ext of extensions) {
+                        resultObj[ext] = false;
+                    }
                 }
 
-                this.sendMessage(miner.socket, {
-                    id: id,
-                    result: [supportedExtensions, config],  // Results in [[], config] due to failed condition
-                    error: null
-                });
+                // For unknown extensions, BIP-310 allows omitting or setting false—here we set false if not handled
+                try {
+                    this.sendMessage(miner.socket, {
+                        id: id,
+                        result: resultObj,  // Object: { "version-rolling": true, "version-rolling.mask": "...", ... }
+                        error: null
+                    });
+                    if (miner.supportsVersionRolling) {
+                        this.sendDifficulty(miner);  // Proactive difficulty after successful config
+                    }
+                } catch (err) {
+                    console.error(`❌ Error sending configure response to ${miner.address}: ${err.message}`);
+                    miner.socket.destroy();
+                }
                 break;
 
             case 'mining.subscribe':
                 console.log(`🔄 PROCESSING mining.subscribe from ${miner.address}`);
                 const subscriptionId = crypto.randomBytes(4).toString('hex');
-                const extranonce1 = crypto.randomBytes(4).toString('hex');
-                const extranonce2Size = 4;
-
+                const extranonce1Size = 4; // Match bitcoin-connector.js
                 miner.subscribed = true;
                 miner.subscriptionId = subscriptionId;
-                miner.extranonce1 = extranonce1;
-                miner.extranonce2Size = extranonce2Size;
-                miner.difficulty = 0.001;
+                miner.extranonce1 = crypto.randomBytes(extranonce1Size).toString('hex');
+                miner.extranonce2Size = 4; // Match bitcoin-connector.js
+                miner.difficulty = 1; // Good for ASICs
                 miner.shareCount = 0;
                 miner.validShares = 0;
                 miner.lastDifficultyAdjust = Date.now();
 
-                this.sendMessage(miner.socket, {
-                    id: id,
-                    result: [[["mining.set_difficulty", subscriptionId], ["mining.notify", subscriptionId]], extranonce1, extranonce2Size],
-                    error: null
-                });
-                this.sendDifficulty(miner);
-                if (this.currentJob) this.sendJob(miner);
-                console.log(`✅ Subscribed ${miner.address}: subscriptionId=${subscriptionId}, extranonce1=${extranonce1}`);
-                this.monitor.recordMinerConnection(minerId, miner.username || 'unknown', miner.address);
+                try {
+                    this.sendMessage(miner.socket, {
+                        id: id,
+                        result: [[], miner.extranonce1, extranonce1Size], // Use local variable
+                        error: null
+                    });
+                    this.sendDifficulty(miner);
+                    if (this.currentJob) {
+                        this.sendJob(miner);
+                    } else {
+                        console.warn(`⚠️ No current job available for ${miner.address}`);
+                    }
+                    console.log(`✅ Subscribed ${miner.address}: subscriptionId=${subscriptionId}, extranonce1=${miner.extranonce1}, extranonce2Size=${miner.extranonce2Size}`);
+                    this.monitor.recordMinerConnection(minerId, miner.username || 'unknown', miner.address);
+                } catch (err) {
+                    console.error(`❌ Error sending subscribe response to ${miner.address}: ${err.message}`);
+                    miner.socket.destroy();
+                }
                 break;
+            
 
-            case 'mining.authorize':
-                console.log(`🔄 PROCESSING mining.authorize from ${miner.address}: params=${JSON.stringify(params)}`);
-                const username = params && params[0] ? params[0] : 'anonymous';
-                const password = params && params[1] ? params[1] : '';
-
-                miner.authorized = true;
-                miner.username = username;
-                miner.lastActivity = Date.now();
-
-                this.sendMessage(miner.socket, {
-                    id: id,
-                    result: true,
-                    error: null
-                });
-                console.log(`✅ Authorized ${miner.address} as ${username}`);
-                this.db.logMinerConnection(minerId, username, miner.address);
-                if (this.currentJob) this.sendJob(miner);
-                break;
 
             case 'mining.submit':
                 console.log(`🔄 PROCESSING mining.submit from ${miner.address}: params=${JSON.stringify(params)}`);
@@ -449,8 +463,54 @@ class RealStratumServer extends EventEmitter {
                 console.warn(`⚠️ Unknown method '${method}' from ${miner.address}`);
                 this.sendError(miner.socket, id, 20, `Unknown method: ${method}`);
                 break;
-        }
-    }
+
+            case 'mining.authorize':
+                console.log(`🔄 PROCESSING mining.authorize from ${miner.address}: username=${params[0]}, password=${params[1]}`);
+                const username = params && params[0] ? params[0] : null;
+                const password = params && params[1] ? params[1] : null;
+
+                // Validate username (solo mining: require non-empty username)
+                if (!username || typeof username !== 'string' || username.trim() === '') {
+                    console.error(`❌ Invalid username from ${miner.address}: ${username}`);
+                    this.sendError(miner.socket, id, 21, 'Invalid or missing username');
+                    miner.socket.destroy();
+                    break;
+                }
+
+                try {
+                    // Update miner object
+                    miner.username = username;
+                    miner.authorized = true;
+                    miner.lastActivity = Date.now();
+
+                    // Update/insert miner record in database
+                    await this.db.logMinerConnection(miner.id, username, miner.address);
+
+                    // Send authorization response
+                    this.sendMessage(miner.socket, {
+                        id: id,
+                        result: true, // Success for solo mining
+                        error: null
+                    });
+
+                    console.log(`✅ Authorized ${miner.address}: username=${username}, minerId=${miner.id.substring(0, 8)}`);
+
+                    // Send current job if available
+                    if (this.currentJob) {
+                        this.sendJob(miner);
+                        console.log(`📤 Sent job ${this.currentJob.jobId} to ${miner.address}`);
+                    } else {
+                        console.warn(`⚠️ No current job available for ${miner.address}`);
+                    }
+
+                    // Log to monitoring system
+                    this.monitor.recordMinerConnection(miner.id, username, miner.address);
+                } catch (err) {
+                    console.error(`❌ Error during authorization for ${miner.address}: ${err.message}`);
+                    this.sendError(miner.socket, id, 20, `Authorization failed: ${err.message}`);
+                    miner.socket.destroy();
+                }
+                break;
 
     handleSubscribe(miner, id, params) {
         const subscriptionId = crypto.randomBytes(4).toString('hex');
@@ -461,7 +521,7 @@ class RealStratumServer extends EventEmitter {
         miner.subscriptionId = subscriptionId;
         miner.extranonce1 = extranonce1;
         miner.extranonce2Size = extranonce2Size; // Store for validation
-        miner.difficulty = 0.001; // Initial difficulty for S9 (~1 valid every ~111 ms at 13 TH/s)
+        miner.difficulty = 4; // Initial difficulty for S9 (~1 valid every ~111 ms at 13 TH/s)
         miner.shareCount = 0;
         miner.validShares = 0;
         miner.lastDifficultyAdjust = Date.now();

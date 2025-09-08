@@ -18,6 +18,47 @@ class DatabaseConnector {
         });
     }
 
+    async logShare(minerId, jobId, nonce, isValid, meetsPoolDiff, meetsNetworkDiff, blockHash, processingTime) {
+        const client = await this.pool.connect();
+        try {
+            await client.query('BEGIN');
+            
+            // Ensure miner exists (upsert if needed)
+            await client.query(
+                'INSERT INTO miners (id, username, ip_address) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING',
+                [minerId, 'unknown', 'unknown'] // Defaults; update via separate call if needed
+            );
+            
+            const result = await client.query(
+                `INSERT INTO shares (miner_id, job_id, nonce, is_valid, meets_pool_difficulty, meets_network_difficulty, block_hash, processing_time_ms) 
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+                [minerId, jobId, nonce, isValid, meetsPoolDiff, meetsNetworkDiff, blockHash, processingTime]
+            );
+            
+            // Update miner stats only if share inserted
+            if (result.rowCount > 0) {
+                await client.query(
+                    'UPDATE miners SET total_shares = total_shares + 1, valid_shares = valid_shares + $2 WHERE id = $1',
+                    [minerId, isValid ? 1 : 0]
+                );
+            }
+            
+            await client.query('COMMIT');
+            console.log(`✅ DB: Share #${result.rows[0]?.id || 'unknown'} logged for ${minerId}: valid=${isValid}`);
+            
+            if (meetsNetworkDiff) {
+                console.log(`🎉 BLOCK FOUND - Share #${result.rows[0]?.id || 'unknown'}`);
+            }
+        } catch (error) {
+            await client.query('ROLLBACK');
+            console.error('Error logging share:', error);
+            // Re-throw for batch processor to handle
+            throw error;
+        } finally {
+            client.release();
+        }
+    }
+
     async logMinerConnection(minerId, username, ipAddress) {
         try {
             await this.pool.query(
