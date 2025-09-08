@@ -565,7 +565,10 @@ class RealStratumServer extends EventEmitter {
 
         // Check difficulties
         const target = this.difficultyToTarget(miner.difficulty);
-        const networkTarget = this.difficultyToTarget(await this.getNetworkTarget() || 73000000000000);
+        
+        const networkDifficulty = this.cachedNetworkDifficulty || 73000000000000;
+        const networkTarget = this.difficultyToTarget(networkDifficulty);
+
         const meetsPoolDiff = this.meetsTarget(blockHash, target);
         const meetsNetworkDiff = this.meetsTarget(blockHash, networkTarget);
 
