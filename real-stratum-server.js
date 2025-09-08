@@ -312,192 +312,181 @@ class RealStratumServer extends EventEmitter {
 
     processMessage(minerId, message) {
         const miner = this.miners.get(minerId);
-        if (!miner) return;
+        if (!miner) {
+            console.log(`❌ No miner found for ID ${minerId}`);
+            return;
+        }
 
-        const { method, params, id } = message;
-        console.log(`🔄 PROCESSING ${method} from ${miner.address}`);
+        const { id, method, params } = message;
+        console.log(`🔄 PROCESSING ${method} from ${miner.address} (ID: ${minerId.substring(0, 8)})`);
 
         switch (method) {
+            case 'mining.configure':
+                console.log(`🔧 Handling mining.configure from ${miner.address}: extensions=${JSON.stringify(params)}`);
+                const extensions = params && params[0] ? params[0] : [];
+                const config = params && params[1] ? params[1] : {};
+
+                let supportedExtensions = [];
+                miner.supportsVersionRolling = false;
+
+                if (extensions.includes('version-rolling') && config['version-rolling']) {
+                    miner.rollingMask = config['version-rolling'].mask || '1fffe000';
+                    miner.minBitCount = config['version-rolling']['min-bit-count'] || 16;
+                    miner.supportsVersionRolling = true;
+                    supportedExtensions = [
+                        ['version-rolling', {
+                            'mask': miner.rollingMask,
+                            'min-bit-count': miner.minBitCount
+                        }]
+                    ];
+                    console.log(`✅ Version-rolling enabled for ${miner.address}: mask=${miner.rollingMask}, min-bits=${miner.minBitCount}`);
+                }
+
+                const configureResponse = {
+                    id: id,
+                    result: [supportedExtensions, config],
+                    error: null
+                };
+                this.sendMessage(miner.socket, configureResponse);
+                break;
+
             case 'mining.subscribe':
                 console.log(`🔄 PROCESSING mining.subscribe from ${miner.address}`);
                 const subscriptionId = crypto.randomBytes(4).toString('hex');
                 const extranonce1 = crypto.randomBytes(4).toString('hex');
-                const extranonce2Size = 4; // Bytes, matches config (4B = 8 hex chars)
+                const extranonce2Size = 4; // Matches BitcoinConnector config
 
                 miner.subscribed = true;
                 miner.subscriptionId = subscriptionId;
                 miner.extranonce1 = extranonce1;
-                miner.extranonce2Size = extranonce2Size; // Store for validation
-                miner.difficulty = 0.001; // Initial difficulty for S9 (~1 valid every ~111 ms at 13 TH/s)
+                miner.extranonce2Size = extranonce2Size;
+                miner.difficulty = 0.001; // Initial diff for ~13 TH/s ASIC (~1 share/111ms)
                 miner.shareCount = 0;
                 miner.validShares = 0;
                 miner.lastDifficultyAdjust = Date.now();
 
-                const response = {
-                    id: message.id,
+                const subscribeResponse = {
+                    id: id,
                     result: [
                         [
                             ["mining.set_difficulty", subscriptionId],
                             ["mining.notify", subscriptionId]
                         ],
-                        extranonce1, // 4 bytes = 8 hex
-                        extranonce2Size // 4 bytes for miner-generated extranonce2
+                        extranonce1,
+                        extranonce2Size
                     ],
                     error: null
                 };
-                this.sendMessage(miner.socket, response);
+                this.sendMessage(miner.socket, subscribeResponse);
                 this.sendDifficulty(miner);
-
                 if (this.currentJob) {
                     this.sendJob(miner);
                 }
-                // Periodic job refresh to prevent timeout
-                setInterval(() => {
-                    if (miner.subscribed && miner.authorized && this.currentJob && miner.socket.writable && !miner.socket.destroyed) {
-                        this.sendJob(miner);
-                        console.log(`🔄 Sent job refresh to ${miner.address}`);
-                    }
-                }, 30000);
-                console.log(`✅ Miner subscribed: ${miner.address} (extranonce1: ${extranonce1}, extranonce2_size: ${extranonce2Size}, difficulty: ${miner.difficulty})`);
+                console.log(`✅ Subscribed ${miner.address}: subscriptionId=${subscriptionId}, extranonce1=${extranonce1}`);
+                this.monitor.recordMinerConnection(minerId, miner.username || 'unknown', miner.address);
                 break;
-            
+
             case 'mining.authorize':
-                console.log(`🔐 Processing authorize from ${miner.address}`);
-                this.handleAuthorize(miner, id, params);
-                break;
-            
-            case 'mining.submit':
-                console.log(`🔄 PROCESSING mining.submit from ${miner.address}`);
-                const params = message.params;
-                const jobId = params[1];
-                let extranonce2 = params[2];
-                const time = params[3];
-                const nonce = params[4];
-                const versionRolled = params[5] || null;
+                console.log(`🔄 PROCESSING mining.authorize from ${miner.address}: params=${JSON.stringify(params)}`);
+                const username = params && params[0] ? params[0] : 'anonymous';
+                const password = params && params[1] ? params[1] : '';
 
-                console.log(`🔍 Validating share for ${miner.username}: jobId=${jobId}, extranonce2=${extranonce2}, time=${time}, nonce=${nonce}, versionRolled=${versionRolled}`);
+                miner.authorized = true;
+                miner.username = username;
+                miner.lastActivity = Date.now();
 
-                // Temporary fallback for empty extranonce2 (remove after confirming non-empty submits)
-                if (!extranonce2 || extranonce2.length === 0) {
-                    extranonce2 = '00000000'; // 4-byte zero pad
-                    console.warn(`⚠️ Empty extranonce2 from ${miner.username}; using zero pad (remove after subscribe fix)`);
-                }
-                if (extranonce2.length !== miner.extranonce2Size * 2) {
-                    console.error(`❌ Invalid extranonce2 length: ${extranonce2.length} (expected ${miner.extranonce2Size * 2})`);
-                    this.sendError(socket, message.id, 23, `Invalid extranonce2 length: ${extranonce2.length}`);
-                    return;
-                }
-
-                // Verify job exists
-                if (!this.currentJob || this.currentJob.jobId !== jobId) {
-                    console.error(`❌ Invalid jobId ${jobId} from ${miner.username}`);
-                    this.sendError(socket, message.id, 21, 'Invalid job');
-                    return;
-                }
-
-                // Version rolling check
-                if (versionRolled && miner.rollingMask) {
-                    const rolledVersion = parseInt(versionRolled, 16);
-                    const mask = parseInt(miner.rollingMask, 16);
-                    const baseVersion = parseInt(this.currentJob.version, 16);
-                    if ((rolledVersion & mask) !== (rolledVersion & mask)) {
-                        console.warn(`⚠️ Version rolling mismatch: ${versionRolled} (base: ${this.currentJob.version}, mask: ${miner.rollingMask})`);
-                    }
-                }
-
-                // Build and validate block header
-                const blockHeader = this.buildOptimizedBlockHeader(miner, extranonce2, time, nonce, versionRolled);
-                const blockHash = this.calculateBlockHash(blockHeader);
-                const coinbaseTx = this.reconstructCoinbase(miner, extranonce2);
-                const coinbaseHash = this.doublesha256(coinbaseTx);
-                const merkleRoot = this.calculateCorrectMerkleRoot(coinbaseHash.toString('hex'), this.currentJob.merkleSteps || []);
-
-                console.log(`DEBUG Share: job=${jobId}, extranonce2=${extranonce2}, coinbaseHash=${coinbaseHash.toString('hex').substring(0, 16)}..., merkleRoot=${merkleRoot.substring(0, 16)}..., blockHash=${blockHash.toString('hex').substring(0, 16)}...`);
-
-                // Validate share against pool difficulty
-                const target = this.difficultyToTarget(miner.difficulty);
-                const reversedHash = Buffer.from(blockHash).reverse();
-                const meetsPoolDiff = this.meetsTarget(blockHash, target);
-
-                // Validate against network difficulty (for block submission)
-                const networkTarget = this.difficultyToTarget(this.cachedNetworkDifficulty || 73197670707408.73);
-                const meetsNetworkDiff = this.meetsTarget(blockHash, networkTarget);
-
-                console.log(`DEBUG Full reversed hash: ${reversedHash.toString('hex')}`);
-                console.log(`DEBUG Full reversed target: ${target.toString('hex')}`);
-                console.log(`DEBUG: Diff=${miner.difficulty}, Target=${target.toString('hex').substring(0, 16)}..., Hash=${reversedHash.toString('hex').substring(0, 16)}..., Compare=${reversedHash.compare(target)}`);
-
-                // Queue share for batch processing
-                const share = {
-                    minerId: miner.id,
-                    jobId: jobId,
-                    nonce: nonce,
-                    isValid: meetsPoolDiff,
-                    meetsPoolDiff: meetsPoolDiff,
-                    meetsNetworkDiff: meetsNetworkDiff,
-                    blockHash: blockHash.toString('hex'),
-                    processingTime: Date.now() - (miner.lastActivity || Date.now())
-                };
-                this.shareQueue.push(share);
-
-                if (meetsPoolDiff) {
-                    miner.validShares++;
-                    console.log(`💎 Valid share: ${miner.username} found nonce ${nonce}`);
-                    this.emit('validShare', { miner, nonce, jobId });
-                    this.adjustMinerDifficulty(miner);
-                } else {
-                    console.log(`🔍 Share validation result: Invalid`);
-                }
-
-                this.sendMessage(socket, { id: message.id, result: meetsPoolDiff, error: meetsPoolDiff ? null : [-23, 'Invalid share', null] });
-
-                // Handle block submission if meets network difficulty
-                if (meetsNetworkDiff) {
-                    console.log(`🎉 Potential block found by ${miner.username}! Submitting...`);
-                    const blockHex = this.buildFullBlock(blockHeader, miner, extranonce2);
-                    this.bitcoin.submitBlock(blockHex).then(result => {
-                        console.log(`Block submission result: ${JSON.stringify(result)}`);
-                        if (!result || result === 'inconclusive') {
-                            this.db.logBlockFound(miner.id, blockHash.toString('hex'), this.currentJob.height);
-                        }
-                    }).catch(error => {
-                        console.error(`❌ Block submission failed: ${error.message}`);
-                    });
-                }
-                break;
-            
-            case 'mining.configure':
-                console.log(`🔄 PROCESSING mining.configure from ${remoteAddress}`);
-                if (!message || !message.params || !Array.isArray(message.params) || message.params.length < 2) {
-                    console.error(`❌ Invalid mining.configure params from ${remoteAddress}: ${JSON.stringify(message)}`);
-                    this.sendError(socket, message.id, 20, 'Invalid configure params');
-                    return;
-                }
-                const configParams = message.params[1] || {};
-                if (configParams['version-rolling'] && configParams['version-rolling.mask']) {
-                    miner.rollingMask = configParams['version-rolling.mask'];
-                    console.log(`🔄 Using miner's requested mask: ${miner.rollingMask}`);
-                } else {
-                    miner.rollingMask = '1fffe000'; // Default mask
-                    console.log(`🔄 No version-rolling mask provided; using default: ${miner.rollingMask}`);
-                }
-                const configResponse = {
-                    id: message.id,
-                    result: {
-                        'version-rolling': !!miner.rollingMask,
-                        'version-rolling.mask': miner.rollingMask,
-                        'minimum-difficulty': true,
-                        'subscribe-extranonce': false
-                    },
+                const authorizeResponse = {
+                    id: id,
+                    result: true,
                     error: null
                 };
-                this.sendMessage(socket, configResponse);
-                console.log(`✅ Sent configure response to ${remoteAddress} with mask ${miner.rollingMask}`);
+                this.sendMessage(miner.socket, authorizeResponse);
+                console.log(`✅ Authorized ${miner.address} as ${username}`);
+                this.db.logMinerConnection(minerId, username, miner.address);
+                if (this.currentJob) {
+                    this.sendJob(miner);
+                }
+                break;
+
+            case 'mining.submit':
+                console.log(`🔄 PROCESSING mining.submit from ${miner.address}: params=${JSON.stringify(params)}`);
+                const startTime = Date.now();
+                const usernameSubmit = params && params[0] ? params[0] : miner.username;
+                const jobId = params && params[1] ? params[1] : null;
+                const extranonce2 = params && params[2] ? params[2] : null;
+                const ntime = params && params[3] ? params[3] : null;
+                const nonce = params && params[4] ? params[4] : null;
+                const versionRolled = miner.supportsVersionRolling && params[5] ? params[5] : null;
+
+                if (!miner.authorized || !miner.subscribed) {
+                    this.sendError(miner.socket, id, 24, 'Not subscribed or authorized');
+                    console.log(`❌ Submit rejected: ${miner.address} not subscribed or authorized`);
+                    return;
+                }
+
+                if (!jobId || !extranonce2 || !ntime || !nonce || jobId !== this.currentJob?.jobId) {
+                    this.sendError(miner.socket, id, 21, 'Invalid job or parameters');
+                    console.log(`❌ Submit rejected: Invalid jobId=${jobId} or missing params`);
+                    return;
+                }
+
+                miner.shares += 1;
+                const processingTime = Date.now() - startTime;
+
+                const header = this.buildOptimizedBlockHeader(miner, extranonce2, ntime, nonce, versionRolled);
+                const blockHash = this.calculateBlockHash(header).reverse().toString('hex');
+                const poolTarget = this.difficultyToTarget(miner.difficulty);
+                const networkTarget = this.difficultyToTarget(this.cachedNetworkDifficulty || 73197670707408.73);
+
+                const meetsPoolDiff = this.meetsTarget(blockHash, poolTarget);
+                const meetsNetworkDiff = this.meetsTarget(blockHash, networkTarget);
+                const isValid = meetsPoolDiff; // Valid if meets pool difficulty
+
+                miner.validShares += isValid ? 1 : 0;
+                this.adjustMinerDifficulty(miner);
+
+                const shareData = {
+                    minerId,
+                    jobId,
+                    nonce,
+                    isValid,
+                    meetsPoolDiff,
+                    meetsNetworkDiff,
+                    blockHash,
+                    processingTime
+                };
+                this.shareQueue.push(shareData);
+
+                this.db.logShare(
+                    minerId,
+                    jobId,
+                    nonce,
+                    isValid,
+                    meetsPoolDiff,
+                    meetsNetworkDiff,
+                    blockHash,
+                    processingTime
+                );
+
+                if (meetsNetworkDiff) {
+                    console.log(`🎉 BLOCK CANDIDATE FOUND by ${miner.address}: hash=${blockHash}`);
+                    this.submitFoundBlock(header, miner, extranonce2);
+                }
+
+                const submitResponse = {
+                    id: id,
+                    result: isValid,
+                    error: isValid ? null : [22, 'Share rejected - low difficulty', null]
+                };
+                this.sendMessage(miner.socket, submitResponse);
+                console.log(`💎 Share processed for ${miner.address}: valid=${isValid}, meetsNetworkDiff=${meetsNetworkDiff}`);
+                this.emit('validShare', { miner, nonce, blockHash });
                 break;
 
             default:
-                console.log(`❓ Unknown method: ${method} from ${miner.address}`);
-                this.sendError(miner.socket, id, -3, 'Method not found');
+                console.warn(`⚠️ Unknown method '${method}' from ${miner.address}`);
+                this.sendError(miner.socket, id, 20, `Unknown method: ${method}`);
+                break;
         }
     }
 
