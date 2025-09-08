@@ -467,36 +467,32 @@ class RealStratumServer extends EventEmitter {
                 break;
             
             case 'mining.configure':
-                console.log(`⚙️ Processing configure from ${miner.address}`);
-                const [requestedExtensions, requestedParams] = params;
-                let negotiatedMask = '1fffe000';  // Default BIP-310 mask
-
-                // Honor miner's requested mask if provided and valid
-                if (requestedExtensions.includes('version-rolling') && requestedParams['version-rolling.mask']) {
-                    const requestedMask = requestedParams['version-rolling.mask'];
-                    if (/^[0-9a-fA-F]{8}$/.test(requestedMask)) {  // Validate 8 hex chars
-                        negotiatedMask = requestedMask;
-                        console.log(`🔄 Using miner's requested mask: ${requestedMask}`);
-                    } else {
-                        console.log(`⚠️ Invalid requested mask ${requestedMask}, using default`);
-                    }
+                console.log(`🔄 PROCESSING mining.configure from ${remoteAddress}`);
+                if (!message || !message.params || !Array.isArray(message.params) || message.params.length < 2) {
+                    console.error(`❌ Invalid mining.configure params from ${remoteAddress}: ${JSON.stringify(message)}`);
+                    this.sendError(socket, message.id, 20, 'Invalid configure params');
+                    return;
                 }
-
-                // Store per-miner
-                miner.rollingMask = negotiatedMask;
-
+                const configParams = message.params[1] || {};
+                if (configParams['version-rolling'] && configParams['version-rolling.mask']) {
+                    miner.rollingMask = configParams['version-rolling.mask'];
+                    console.log(`🔄 Using miner's requested mask: ${miner.rollingMask}`);
+                } else {
+                    miner.rollingMask = '1fffe000'; // Default mask
+                    console.log(`🔄 No version-rolling mask provided; using default: ${miner.rollingMask}`);
+                }
                 const configResponse = {
-                    id: id,
+                    id: message.id,
                     result: {
-                        "version-rolling": true,
-                        "version-rolling.mask": negotiatedMask,  // Use negotiated
-                        "minimum-difficulty": true,
-                        "subscribe-extranonce": false
+                        'version-rolling': !!miner.rollingMask,
+                        'version-rolling.mask': miner.rollingMask,
+                        'minimum-difficulty': true,
+                        'subscribe-extranonce': false
                     },
                     error: null
                 };
-                this.sendMessage(miner.socket, configResponse);
-                console.log(`✅ Sent configure response to ${miner.address} with mask ${negotiatedMask}`);
+                this.sendMessage(socket, configResponse);
+                console.log(`✅ Sent configure response to ${remoteAddress} with mask ${miner.rollingMask}`);
                 break;
 
             default:
