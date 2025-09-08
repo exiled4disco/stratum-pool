@@ -149,46 +149,51 @@ class RealStratumServer extends EventEmitter {
             difficulty = 0.00001;
         }
         
-        // Bitcoin's maximum target (difficulty 1)
-        const maxTargetHex = '00000000FFFF0000000000000000000000000000000000000000000000000000';
-        const maxTarget = BigInt('0x' + maxTargetHex);
+        // Bitcoin's maximum target (difficulty 1) - this is the correct value
+        const maxTarget = BigInt('0x00000000FFFF0000000000000000000000000000000000000000000000000000');
         
-        const diffFloat = parseFloat(difficulty);
+        // Convert difficulty to BigInt for precise calculation
+        const difficultyBig = BigInt(Math.floor(difficulty * 1000000)) / BigInt(1000000);
+        
         let targetBig;
-        
-        if (diffFloat >= 1.0) {
-            // For difficulty >= 1: target = maxTarget / floor(difficulty)
-            const d = BigInt(Math.floor(diffFloat));
-            targetBig = maxTarget / d;
+        if (difficulty >= 1.0) {
+            // For difficulty >= 1: target = maxTarget / difficulty
+            targetBig = maxTarget / BigInt(Math.floor(difficulty));
         } else {
-            // For difficulty < 1: target = maxTarget * (1 / difficulty)
-            // Use scaling for precision (10^18)
-            const scale = 1000000000000000000n; // 1e18
-            const recipFloat = 1.0 / diffFloat;
-            // Round to nearest integer for recip * scale
-            const recipBigApprox = BigInt(Math.floor(recipFloat * Number(scale)) + 0.5);
-            targetBig = (maxTarget * recipBigApprox) / scale;
+            // For difficulty < 1: target = maxTarget / difficulty (will be larger than maxTarget)
+            const scaledDiff = Math.floor(difficulty * 1000000);
+            targetBig = (maxTarget * BigInt(1000000)) / BigInt(scaledDiff);
             
-            // Cap at maximum 256-bit value if overflow (all hashes would pass, but unlikely for your diffs)
-            const maxUint256 = (1n << 256n) - 1n;
+            // Cap at maximum possible value
+            const maxUint256 = (BigInt(1) << BigInt(256)) - BigInt(1);
             if (targetBig > maxUint256) {
                 targetBig = maxUint256;
             }
         }
         
+        // Convert to 32-byte buffer (big-endian)
         const targetHex = targetBig.toString(16).padStart(64, '0');
-        console.log(`🔧 Computed target hex (first 16 chars): ${targetHex.substring(0, 16)}`);
+        console.log(`🔧 Computed target: ${targetHex}`);
+        
         return Buffer.from(targetHex, 'hex');
     }
 
     /**
-     * Check if hash meets target difficulty
+     * Check if hash meets target difficulty (fixed implementation)
      */
     meetsTarget(hash, target) {
-        const reversedHash = Buffer.from(hash).reverse();
-        return reversedHash.compare(target) <= 0;
+        // Convert hash to big-endian for comparison
+        const hashBE = Buffer.from(hash).reverse();
+        
+        // Compare as big-endian: hash <= target means valid
+        const result = hashBE.compare(target) <= 0;
+        
+        if (result) {
+            console.log(`✅ Hash meets target: ${hashBE.toString('hex').substring(0, 16)}... <= ${target.toString('hex').substring(0, 16)}...`);
+        }
+        
+        return result;
     }
-
     adjustMinerDifficulty(miner) {
         const now = Date.now();
         const timeSinceLastAdjust = now - (miner.lastDifficultyAdjust || now);
@@ -332,20 +337,18 @@ class RealStratumServer extends EventEmitter {
         const config = params && params[1] ? params[1] : {};
         miner.supportsVersionRolling = false;
 
-        const resultObj = {};  // Object/map for BIP-310 compliance
-
+        const resultObj = {};
         if (extensions.includes('version-rolling')) {
             const mask = config['version-rolling.mask'] || '1fffe000';
             const minBitCount = parseInt(config['version-rolling.min-bit-count']) || 16;
             miner.rollingMask = mask;
             miner.minBitCount = minBitCount;
             miner.supportsVersionRolling = true;
-            resultObj['version-rolling'] = true;  // Confirm support
-            resultObj['version-rolling.mask'] = mask;  // Echo mask
-            resultObj['version-rolling.min-bit-count'] = minBitCount;  // Echo for diagnostics
+            resultObj['version-rolling'] = true;
+            resultObj['version-rolling.mask'] = mask;
+            resultObj['version-rolling.min-bit-count'] = minBitCount;
             console.log(`✅ Version-rolling enabled for ${miner.address}: mask=${mask}, min-bits=${minBitCount}`);
         } else {
-            // If no extensions or unsupported, set false for requested ones
             for (const ext of extensions) {
                 resultObj[ext] = false;
             }
@@ -354,12 +357,10 @@ class RealStratumServer extends EventEmitter {
         try {
             this.sendMessage(miner.socket, {
                 id: id,
-                result: resultObj,  // Object: { "version-rolling": true, "version-rolling.mask": "...", ... }
+                result: resultObj,
                 error: null
             });
-            if (miner.supportsVersionRolling) {
-                this.sendDifficulty(miner);  // Proactive difficulty after successful config
-            }
+            // Remove proactive difficulty send; handled in subscribe
         } catch (err) {
             console.error(`❌ Error sending configure response to ${miner.address}: ${err.message}`);
             miner.socket.destroy();
@@ -528,7 +529,13 @@ class RealStratumServer extends EventEmitter {
 
         // Build header with rolled version
         const header = this.buildOptimizedBlockHeader(this.currentJob, miner, merkleRoot, ntime, nonce, rolledVersion);
+        console.log(`DEBUG Full header hex: ${header.toString('hex')}`);
+
+        // Calculate hash only once
         const blockHash = this.calculateBlockHash(header); // LE bytes
+        console.log(`DEBUG Calculated hash LE: ${blockHash.toString('hex')}`);
+        console.log(`DEBUG Calculated hash BE: ${Buffer.from(blockHash).reverse().toString('hex')}`);
+
         const processingTime = Date.now() - startTime;
 
         // Check difficulties
@@ -617,31 +624,34 @@ class RealStratumServer extends EventEmitter {
         const header = Buffer.alloc(80);
         let offset = 0;
         
-        // Version: LE
+        // Version: LE (4 bytes)
         header.writeUInt32LE(version, offset);
         offset += 4;
         
-        // Prev block hash: LE (job.prevHash is reversed hex from getBlockTemplate)
+        // Previous block hash: LE (32 bytes) 
+        // job.prevHash is already in LE format from getBlockTemplate
         const prevHashBuf = Buffer.from(job.prevHash, 'hex');
         prevHashBuf.copy(header, offset);
         offset += 32;
         
-        // Merkle root: LE (reverse BE hex for header)
+        // Merkle root: LE (32 bytes)
+        // Convert merkleRoot from BE hex to LE bytes
         Buffer.from(merkleRoot, 'hex').reverse().copy(header, offset);
         offset += 32;
         
-        // Timestamp: LE
+        // Timestamp: LE (4 bytes)
         header.writeUInt32LE(parseInt(time, 16), offset);
         offset += 4;
         
-        // Difficulty bits: LE
+        // Difficulty bits: LE (4 bytes)  
         header.writeUInt32LE(parseInt(job.nbits, 16), offset);
         offset += 4;
         
-        // Nonce: LE
+        // Nonce: LE (4 bytes)
         header.writeUInt32LE(parseInt(nonce, 16), offset);
         
-        console.log(`DEBUG Header: version=${version.toString(16)}, prevHash=${job.prevHash.substring(0, 16)}..., merkle=${merkleRoot.substring(0, 16)}..., ntime=${parseInt(time, 16).toString(16)}, nbits=${job.nbits}, nonce=${parseInt(nonce, 16).toString(16)}`);
+        console.log(`DEBUG Header built: version=${version.toString(16)}, prevHash=${job.prevHash.substring(0, 16)}..., merkle=${merkleRoot.substring(0, 16)}..., ntime=${parseInt(time, 16).toString(16)}, nbits=${job.nbits}, nonce=${parseInt(nonce, 16).toString(16)}`);
+        
         return header;
     }
 
