@@ -93,38 +93,63 @@ class RealStratumServer extends EventEmitter {
         }
     }
 
-    async updateWork() {
+    async updateWork(retryCount = 0, maxRetries = 3) {
         try {
-            const job = await this.bitcoin.getBlockTemplate({ rules: ["segwit"] }); // Explicitly request SegWit rules
-            if (!job) {
-                console.error('❌ getblocktemplate returned null or undefined');
-                console.log('DEBUG Attempting retry in 10s...');
-                setTimeout(() => this.updateWork(), 10000);
+            const job = await this.bitcoin.getBlockTemplate();
+            console.log(`DEBUG getblocktemplate raw response: ${JSON.stringify(job, null, 2)}`);
+            if (!job || typeof job !== 'object') {
+                console.error(`❌ getblocktemplate returned null or non-object (retry ${retryCount}/${maxRetries})`);
+                if (retryCount < maxRetries) {
+                    const delay = Math.pow(2, retryCount) * 10000; // Exponential backoff: 10s, 20s, 40s
+                    console.log(`DEBUG Retrying in ${delay/1000}s...`);
+                    setTimeout(() => this.updateWork(retryCount + 1, maxRetries), delay);
+                } else {
+                    console.error('❌ Max retries reached; check Bitcoin node connectivity');
+                }
                 return;
             }
-            // Log full response
-            console.log(`DEBUG getblocktemplate response: ${JSON.stringify(job, null, 2)}`);
-            // Validate critical fields
-            if (!job.coinb1 || !job.coinb2 || !job.transactions || !job.nbits || !job.ntime || !job.height) {
-                console.error(`❌ Invalid job: missing required fields (coinb1=${!!job.coinb1}, coinb2=${!!job.coinb2}, transactions=${!!job.transactions}, nbits=${!!job.ntime}, height=${!!job.height})`);
-                console.log('DEBUG Attempting retry in 10s...');
-                setTimeout(() => this.updateWork(), 10000);
+            // Validate required fields
+            const requiredFields = ['coinb1', 'coinb2', 'transactions', 'nbits', 'ntime', 'height'];
+            const missingFields = requiredFields.filter(field => !job[field]);
+            if (missingFields.length > 0) {
+                console.error(`❌ Invalid job: missing fields ${missingFields.join(', ')} (retry ${retryCount}/${maxRetries})`);
+                console.log(`DEBUG Job fields: ${JSON.stringify({
+                    coinb1: !!job.coinb1,
+                    coinb2: !!job.coinb2,
+                    transactions: Array.isArray(job.transactions) ? job.transactions.length : 'invalid',
+                    nbits: !!job.nbits,
+                    ntime: !!job.ntime,
+                    height: !!job.height
+                }, null, 2)}`);
+                if (retryCount < maxRetries) {
+                    const delay = Math.pow(2, retryCount) * 10000;
+                    console.log(`DEBUG Retrying in ${delay/1000}s...`);
+                    setTimeout(() => this.updateWork(retryCount + 1, maxRetries), delay);
+                } else {
+                    console.error('❌ Max retries reached; verify getblocktemplate response');
+                }
                 return;
             }
-            // Debug job details
-            console.log(`DEBUG Job: coinb1=${job.coinb1} (length=${job.coinb1.length}), coinb2=${job.coinb2} (length=${job.coinb2.length}), transactions=${job.transactions.length}, default_witness_commitment=${job.default_witness_commitment ? job.default_witness_commitment.substring(0, 20) + '...' : 'none'}, nbits=${job.nbits}, ntime=${job.ntime}, height=${job.height}`);
-            if (job && (!this.currentJob || job.height !== this.currentJob.height)) {
+            // Assign jobId if missing
+            job.jobId = job.jobId || Date.now().toString(16);
+            console.log(`DEBUG Job: jobId=${job.jobId}, coinb1=${job.coinb1.slice(0, 20)}... (length=${job.coinb1.length}), coinb2=${job.coinb2.slice(0, 20)}... (length=${job.coinb2.length}), transactions=${job.transactions.length}, nbits=${job.nbits}, ntime=${job.ntime}, height=${job.height}`);
+            if (!this.currentJob || job.height !== this.currentJob.height) {
                 if (this.currentJob) {
                     delete this.currentJob.cachedCoinbaseTemplate;
                 }
                 this.currentJob = job;
                 this.broadcastJob(job);
-                console.log(`New work created for block height ${job.height}`);
+                console.log(`✅ New work created for block height ${job.height}`);
             }
         } catch (error) {
-            console.error('❌ Error updating work:', error.message);
-            console.log('DEBUG Attempting retry in 10s...');
-            setTimeout(() => this.updateWork(), 10000);
+            console.error(`❌ Error updating work (retry ${retryCount}/${maxRetries}):`, error.message);
+            if (retryCount < maxRetries) {
+                const delay = Math.pow(2, retryCount) * 10000;
+                console.log(`DEBUG Retrying in ${delay/1000}s...`);
+                setTimeout(() => this.updateWork(retryCount + 1, maxRetries), delay);
+            } else {
+                console.error('❌ Max retries reached; check Bitcoin node or connector');
+            }
         }
     }
 
@@ -793,17 +818,12 @@ class RealStratumServer extends EventEmitter {
         setInterval(async () => {
             console.log(`🕒 Batch processor tick, queue size: ${this.shareQueue.length}`);
             if (this.shareQueue.length > 0) {
-                const batch = this.shareQueue.splice(0, 1000); // Handle 500 TH/s
+                const batch = this.shareQueue.splice(0, 5000); // Handle 500 TH/s
                 console.log(`📦 Processing batch of ${batch.length} shares...`);
                 try {
                     const validShares = batch.filter(s => s.isValid).length;
-                    
                     for (const share of batch) {
                         try {
-                            // Mock DB for testing
-                            console.log(`Mock logging share for ${share.minerId}: valid=${share.isValid}`);
-                            // Uncomment real DB call after confirming
-                            /*
                             await this.db.logShare(
                                 share.minerId,
                                 share.jobId,
@@ -814,15 +834,14 @@ class RealStratumServer extends EventEmitter {
                                 share.blockHash,
                                 share.processingTime
                             );
-                            */
+                            console.log(`✅ Logged share for ${share.minerId}: valid=${share.isValid}`);
                         } catch (dbErr) {
-                            console.error(`DB logShare error for miner ${share.minerId}:`, dbErr.message);
+                            console.error(`❌ DB logShare error for miner ${share.minerId}:`, dbErr.message);
                         }
                     }
-                    
                     console.log(`📊 Processed ${batch.length} shares (${validShares} valid)`);
                 } catch (error) {
-                    console.error('Batch processing error:', error.message);
+                    console.error('❌ Batch processing error:', error.message);
                 }
             }
         }, 5000);
